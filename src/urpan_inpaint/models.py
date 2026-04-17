@@ -72,6 +72,11 @@ class FrameRecord:
     semantic_has_logits: bool = False
     semantic_parse_status: str = "pending"
     semantic_parse_error: str = ""
+    grounding_model_id: str = ""
+    grounding_output_dir: Optional[Path] = None
+    grounding_box_count: Optional[int] = None
+    grounding_detect_status: str = "pending"
+    grounding_detect_error: str = ""
 
     def to_manifest_row(self) -> dict[str, str]:
         return {
@@ -128,6 +133,11 @@ class FrameRecord:
             "semantic_has_logits": "1" if self.semantic_has_logits else "0",
             "semantic_parse_status": self.semantic_parse_status,
             "semantic_parse_error": self.semantic_parse_error,
+            "grounding_model_id": self.grounding_model_id,
+            "grounding_output_dir": "" if self.grounding_output_dir is None else str(self.grounding_output_dir),
+            "grounding_box_count": "" if self.grounding_box_count is None else str(self.grounding_box_count),
+            "grounding_detect_status": self.grounding_detect_status,
+            "grounding_detect_error": self.grounding_detect_error,
         }
 
 
@@ -160,6 +170,10 @@ class SequenceManifest:
         semantic_failed_frames = [
             row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
         ]
+        detected_frames = sum(1 for row in self.rows if row.grounding_detect_status == "detected")
+        grounding_failed_frames = [
+            row.frame_name for row in self.rows if row.grounding_detect_status == "failed"
+        ]
         return {
             "sequence_id": self.sequence_id,
             "sequence_dir": str(self.sequence_dir),
@@ -179,5 +193,7 @@ class SequenceManifest:
             "projection_failed_frames": projection_failed_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
+            "detected_frames": detected_frames,
+            "grounding_failed_frames": grounding_failed_frames,
             "required_csv_fields": list(REQUIRED_CSV_FIELDS),
         }

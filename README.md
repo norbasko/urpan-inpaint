@@ -29,6 +29,12 @@ This implementation currently covers:
   - write confidence maps when available,
   - write panoptic instance maps and segment sidecars when available,
   - use a Cityscapes Mask2Former checkpoint by default and continue even if only semantic outputs are available.
+- Open-vocabulary dynamic detection:
+  - run Grounding DINO on cubemap faces,
+  - use the default prompt vocabulary `person`, `pedestrian`, `rider`, `bicyclist`, `bicycle`, `motorcycle`, `scooter`, `car`, `van`, `pickup truck`, `truck`, `bus`, `trailer`, `caravan`,
+  - drop detections below `box_threshold`,
+  - merge overlapping detections with class-aware NMS,
+  - keep small high-confidence detections because vulnerable road users matter.
 
 ## Install
 
@@ -36,7 +42,7 @@ This implementation currently covers:
 python3 -m pip install -e .
 ```
 
-For Mask2Former, install the optional ML runtime in the `urpan-inpaint` environment:
+For Mask2Former and Grounding DINO, install the optional ML runtime in the `urpan-inpaint` environment:
 
 ```bash
 python3 -m pip install -e ".[ml]"
@@ -114,6 +120,26 @@ urpan-inpaint parse-semantic \
   --skip-panoptic
 ```
 
+Run Grounding DINO dynamic detection on cubemap faces:
+
+```bash
+urpan-inpaint detect-dynamic \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --grounding-model-id IDEA-Research/grounding-dino-tiny
+```
+
+Override the prompt set and tighten detection filtering:
+
+```bash
+urpan-inpaint detect-dynamic \
+  --grounding-prompt person \
+  --grounding-prompt bicycle \
+  --grounding-prompt car \
+  --box-threshold 0.3 \
+  --nms-iou-threshold 0.6
+```
+
 
 ## Output layout
 
@@ -155,5 +181,18 @@ Semantic face outputs are written under each frame's cubemap cache directory:
     metadata.json
     front.npz
     front.panoptic.json
+    ...
+```
+
+Grounding DINO outputs are written alongside the cubemap cache as:
+
+```text
+<output-root>/GSxxxxxx/cubemap/GSxxxxxx-frame-YYYYYY/
+  grounding_dino/
+    metadata.json
+    front.npz
+    front.json
+    right.npz
+    right.json
     ...
 ```

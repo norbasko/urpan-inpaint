@@ -271,6 +271,11 @@ def write_sequence_manifest(manifest: SequenceManifest) -> None:
             "semantic_has_logits",
             "semantic_parse_status",
             "semantic_parse_error",
+            "grounding_model_id",
+            "grounding_output_dir",
+            "grounding_box_count",
+            "grounding_detect_status",
+            "grounding_detect_error",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

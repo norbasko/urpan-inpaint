@@ -4,7 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
+from urpan_inpaint.config import DEFAULT_GROUNDING_DINO_PROMPTS
 from urpan_inpaint.config import IndexConfig
+from urpan_inpaint.detection import run_grounding_detection
 from urpan_inpaint.discovery import run_indexing
 from urpan_inpaint.normalization import run_erp_normalization
 from urpan_inpaint.projection import run_cubemap_projection
@@ -233,6 +235,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip panoptic post-processing even if the checkpoint supports it.",
     )
 
+    grounding_parser = subparsers.add_parser(
+        "detect-dynamic",
+        help="Run Grounding DINO on cubemap faces to recover dynamic-object detections missed by semantic parsing.",
+    )
+    grounding_parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust"),
+        help="Dataset root containing GS* sequence directories.",
+    )
+    grounding_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust/inpaint"),
+        help="Output root for manifests and later pipeline artifacts.",
+    )
+    grounding_parser.add_argument(
+        "--sequence",
+        action="append",
+        default=[],
+        help="Sequence ID to process. May be passed multiple times.",
+    )
+    grounding_parser.add_argument(
+        "--min-valid-frames",
+        type=int,
+        default=3,
+        help="Minimum valid frames required for a sequence to remain eligible.",
+    )
+    grounding_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run Grounding DINO without writing output files.",
+    )
+    grounding_parser.add_argument(
+        "--skip-checksum",
+        action="store_true",
+        help="Skip SHA-256 computation on the original JPEG bytes.",
+    )
+    grounding_parser.add_argument(
+        "--cube-face-size",
+        type=int,
+        default=1536,
+        help="Inner cubemap face size in pixels before overlap padding when projection cache is missing.",
+    )
+    grounding_parser.add_argument(
+        "--cube-overlap-px",
+        type=int,
+        default=64,
+        help="Guard-band overlap on all cubemap faces when projection cache is missing.",
+    )
+    grounding_parser.add_argument(
+        "--skip-face-cache",
+        action="store_true",
+        help="Keep projected face tensors in memory only if cubemap cache is missing.",
+    )
+    grounding_parser.add_argument(
+        "--grounding-model-id",
+        default="IDEA-Research/grounding-dino-tiny",
+        help="Grounding DINO checkpoint identifier or local path.",
+    )
+    grounding_parser.add_argument(
+        "--grounding-device",
+        default="auto",
+        help="Torch device for inference. Use auto, cpu, cuda, or mps.",
+    )
+    grounding_parser.add_argument(
+        "--grounding-local-files-only",
+        action="store_true",
+        help="Restrict model loading to locally cached files.",
+    )
+    grounding_parser.add_argument(
+        "--grounding-prompt",
+        action="append",
+        default=[],
+        help="Candidate prompt term. May be passed multiple times. Defaults to the built-in road-user prompt set.",
+    )
+    grounding_parser.add_argument(
+        "--box-threshold",
+        type=float,
+        default=0.25,
+        help="Drop detections below this Grounding DINO box confidence threshold.",
+    )
+    grounding_parser.add_argument(
+        "--text-threshold",
+        type=float,
+        default=0.25,
+        help="Phrase-token confidence threshold used by Grounding DINO label extraction.",
+    )
+    grounding_parser.add_argument(
+        "--nms-iou-threshold",
+        type=float,
+        default=0.7,
+        help="IoU threshold for class-aware NMS after Grounding DINO post-processing.",
+    )
+
     return parser
 
 
@@ -374,6 +471,62 @@ def handle_parse_semantic(args: argparse.Namespace) -> int:
     return 0 if summary["failed_sequences"] == 0 else 1
 
 
+def handle_detect_dynamic(args: argparse.Namespace) -> int:
+    prompts = tuple(args.grounding_prompt) if args.grounding_prompt else DEFAULT_GROUNDING_DINO_PROMPTS
+    config = IndexConfig(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        min_valid_frames=args.min_valid_frames,
+        dry_run=args.dry_run,
+        compute_checksums=not args.skip_checksum,
+        cube_face_size=args.cube_face_size,
+        cube_overlap_px=args.cube_overlap_px,
+        cache_cubemap_faces=not args.skip_face_cache,
+        grounding_model_id=args.grounding_model_id,
+        grounding_device=args.grounding_device,
+        grounding_local_files_only=args.grounding_local_files_only,
+        grounding_prompts=prompts,
+        grounding_box_threshold=args.box_threshold,
+        grounding_text_threshold=args.text_threshold,
+        grounding_nms_iou_threshold=args.nms_iou_threshold,
+    )
+    manifests = run_grounding_detection(config, sequence_ids=args.sequence or None)
+    summary = {
+        "dataset_root": str(config.dataset_root),
+        "output_root": str(config.output_root),
+        "dry_run": config.dry_run,
+        "compute_checksums": config.compute_checksums,
+        "cube_face_size": config.cube_face_size,
+        "cube_overlap_px": config.cube_overlap_px,
+        "cache_cubemap_faces": config.cache_cubemap_faces,
+        "grounding_model_id": config.grounding_model_id,
+        "grounding_device": config.grounding_device,
+        "grounding_local_files_only": config.grounding_local_files_only,
+        "grounding_prompts": list(config.grounding_prompts),
+        "grounding_box_threshold": config.grounding_box_threshold,
+        "grounding_text_threshold": config.grounding_text_threshold,
+        "grounding_nms_iou_threshold": config.grounding_nms_iou_threshold,
+        "sequence_count": len(manifests),
+        "detected_sequences": sum(1 for item in manifests if item.status == "ready"),
+        "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
+        "detected_frames": sum(
+            sum(1 for row in item.rows if row.grounding_detect_status == "detected")
+            for item in manifests
+        ),
+        "failed_frames": sum(
+            sum(1 for row in item.rows if row.grounding_detect_status == "failed")
+            for item in manifests
+        ),
+        "total_boxes": sum(
+            sum((row.grounding_box_count or 0) for row in item.rows if row.grounding_detect_status == "detected")
+            for item in manifests
+        ),
+        "sequences": [item.to_summary_dict() for item in manifests],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["failed_sequences"] == 0 else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -385,6 +538,8 @@ def main() -> int:
         return handle_project_cubemap(args)
     if args.command == "parse-semantic":
         return handle_parse_semantic(args)
+    if args.command == "detect-dynamic":
+        return handle_detect_dynamic(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
