@@ -276,6 +276,12 @@ def write_sequence_manifest(manifest: SequenceManifest) -> None:
             "grounding_box_count",
             "grounding_detect_status",
             "grounding_detect_error",
+            "sam2_model_id",
+            "sam2_output_dir",
+            "sam2_mask_count",
+            "sam2_temporal_prior_count",
+            "sam2_refine_status",
+            "sam2_refine_error",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

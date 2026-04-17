@@ -77,6 +77,12 @@ class FrameRecord:
     grounding_box_count: Optional[int] = None
     grounding_detect_status: str = "pending"
     grounding_detect_error: str = ""
+    sam2_model_id: str = ""
+    sam2_output_dir: Optional[Path] = None
+    sam2_mask_count: Optional[int] = None
+    sam2_temporal_prior_count: Optional[int] = None
+    sam2_refine_status: str = "pending"
+    sam2_refine_error: str = ""
 
     def to_manifest_row(self) -> dict[str, str]:
         return {
@@ -138,6 +144,14 @@ class FrameRecord:
             "grounding_box_count": "" if self.grounding_box_count is None else str(self.grounding_box_count),
             "grounding_detect_status": self.grounding_detect_status,
             "grounding_detect_error": self.grounding_detect_error,
+            "sam2_model_id": self.sam2_model_id,
+            "sam2_output_dir": "" if self.sam2_output_dir is None else str(self.sam2_output_dir),
+            "sam2_mask_count": "" if self.sam2_mask_count is None else str(self.sam2_mask_count),
+            "sam2_temporal_prior_count": (
+                "" if self.sam2_temporal_prior_count is None else str(self.sam2_temporal_prior_count)
+            ),
+            "sam2_refine_status": self.sam2_refine_status,
+            "sam2_refine_error": self.sam2_refine_error,
         }
 
 
@@ -174,6 +188,10 @@ class SequenceManifest:
         grounding_failed_frames = [
             row.frame_name for row in self.rows if row.grounding_detect_status == "failed"
         ]
+        refined_frames = sum(1 for row in self.rows if row.sam2_refine_status == "refined")
+        sam2_failed_frames = [
+            row.frame_name for row in self.rows if row.sam2_refine_status == "failed"
+        ]
         return {
             "sequence_id": self.sequence_id,
             "sequence_dir": str(self.sequence_dir),
@@ -195,5 +213,7 @@ class SequenceManifest:
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,
             "grounding_failed_frames": grounding_failed_frames,
+            "refined_frames": refined_frames,
+            "sam2_failed_frames": sam2_failed_frames,
             "required_csv_fields": list(REQUIRED_CSV_FIELDS),
         }

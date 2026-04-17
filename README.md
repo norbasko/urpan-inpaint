@@ -35,6 +35,11 @@ This implementation currently covers:
   - drop detections below `box_threshold`,
   - merge overlapping detections with class-aware NMS,
   - keep small high-confidence detections because vulnerable road users matter.
+- Promptable mask refinement and temporal propagation:
+  - run SAM 2 video inference on cubemap-face frame sequences with streaming memory,
+  - refine Grounding DINO boxes, semantic region boxes/points, and the explicit down-face roof prompt,
+  - refine sky and Cityscapes-style skyline classes when their semantic masks are available,
+  - associate stable prompts across neighboring frames and propagate refined masks through SAM 2 memory.
 
 ## Install
 
@@ -42,7 +47,7 @@ This implementation currently covers:
 python3 -m pip install -e .
 ```
 
-For Mask2Former and Grounding DINO, install the optional ML runtime in the `urpan-inpaint` environment:
+For Mask2Former, Grounding DINO, and SAM 2, install the optional ML runtime in the `urpan-inpaint` environment:
 
 ```bash
 python3 -m pip install -e ".[ml]"
@@ -140,6 +145,22 @@ urpan-inpaint detect-dynamic \
   --nms-iou-threshold 0.6
 ```
 
+Run SAM 2 refinement from the coarse masks and boxes:
+
+```bash
+urpan-inpaint refine-masks \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --sam2-model-id facebook/sam2.1-hiera-tiny
+```
+
+Restrict SAM 2 to local checkpoint files and disable temporal prior prompting:
+
+```bash
+urpan-inpaint refine-masks \
+  --sam2-local-files-only \
+  --disable-temporal-propagation
+```
 
 ## Output layout
 
@@ -196,3 +217,18 @@ Grounding DINO outputs are written alongside the cubemap cache as:
     right.json
     ...
 ```
+
+SAM 2 refined masks are written alongside the cubemap cache as:
+
+```text
+<output-root>/GSxxxxxx/cubemap/GSxxxxxx-frame-YYYYYY/
+  sam2_refined/
+    metadata.json
+    front.npz
+    front.json
+    right.npz
+    right.json
+    ...
+```
+
+Each SAM 2 face `.npz` contains binary `masks`, refined `boxes_xyxy`, `scores`, `class_text`, prompt provenance, and a `used_temporal_prior` flag. The down face is always eligible for the roof prompt unless `--skip-roof-prompt` is passed.

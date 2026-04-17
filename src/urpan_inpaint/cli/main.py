@@ -4,12 +4,13 @@ import argparse
 import json
 from pathlib import Path
 
-from urpan_inpaint.config import DEFAULT_GROUNDING_DINO_PROMPTS
+from urpan_inpaint.config import DEFAULT_GROUNDING_DINO_PROMPTS, DEFAULT_SAM2_SEMANTIC_PROMPT_CLASSES
 from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.detection import run_grounding_detection
 from urpan_inpaint.discovery import run_indexing
 from urpan_inpaint.normalization import run_erp_normalization
 from urpan_inpaint.projection import run_cubemap_projection
+from urpan_inpaint.refinement import run_sam2_refinement
 from urpan_inpaint.semantic import run_semantic_parsing
 
 
@@ -330,6 +331,144 @@ def build_parser() -> argparse.ArgumentParser:
         help="IoU threshold for class-aware NMS after Grounding DINO post-processing.",
     )
 
+    refine_parser = subparsers.add_parser(
+        "refine-masks",
+        help="Use SAM 2 to refine coarse semantic regions, Grounding DINO boxes, down-face roof prompts, and stable temporal priors.",
+    )
+    refine_parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust"),
+        help="Dataset root containing GS* sequence directories.",
+    )
+    refine_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust/inpaint"),
+        help="Output root for manifests and later pipeline artifacts.",
+    )
+    refine_parser.add_argument(
+        "--sequence",
+        action="append",
+        default=[],
+        help="Sequence ID to process. May be passed multiple times.",
+    )
+    refine_parser.add_argument(
+        "--min-valid-frames",
+        type=int,
+        default=3,
+        help="Minimum valid frames required for a sequence to remain eligible.",
+    )
+    refine_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run SAM 2 refinement without writing output files.",
+    )
+    refine_parser.add_argument(
+        "--skip-checksum",
+        action="store_true",
+        help="Skip SHA-256 computation on the original JPEG bytes.",
+    )
+    refine_parser.add_argument(
+        "--cube-face-size",
+        type=int,
+        default=1536,
+        help="Inner cubemap face size in pixels before overlap padding when projection cache is missing.",
+    )
+    refine_parser.add_argument(
+        "--cube-overlap-px",
+        type=int,
+        default=64,
+        help="Guard-band overlap on all cubemap faces when projection cache is missing.",
+    )
+    refine_parser.add_argument(
+        "--skip-face-cache",
+        action="store_true",
+        help="Keep projected face tensors in memory only if cubemap cache is missing.",
+    )
+    refine_parser.add_argument(
+        "--sam2-model-id",
+        default="facebook/sam2.1-hiera-tiny",
+        help="SAM 2 checkpoint identifier or local path.",
+    )
+    refine_parser.add_argument(
+        "--sam2-device",
+        default="auto",
+        help="Torch device for inference. Use auto, cpu, cuda, or mps.",
+    )
+    refine_parser.add_argument(
+        "--sam2-local-files-only",
+        action="store_true",
+        help="Restrict SAM 2 model loading to locally cached files.",
+    )
+    refine_parser.add_argument(
+        "--sam2-mask-threshold",
+        type=float,
+        default=0.0,
+        help="Mask binarization threshold passed to SAM 2 post-processing.",
+    )
+    refine_parser.add_argument(
+        "--sam2-min-mask-area-px",
+        type=int,
+        default=16,
+        help="Drop refined masks with fewer foreground pixels than this.",
+    )
+    refine_parser.add_argument(
+        "--skip-grounding-prompts",
+        action="store_true",
+        help="Do not use Grounding DINO boxes as SAM 2 prompts.",
+    )
+    refine_parser.add_argument(
+        "--skip-semantic-prompts",
+        action="store_true",
+        help="Do not use semantic region boxes/points as SAM 2 prompts.",
+    )
+    refine_parser.add_argument(
+        "--skip-roof-prompt",
+        action="store_true",
+        help="Do not add the down-face nadir roof prompt.",
+    )
+    refine_parser.add_argument(
+        "--sam2-semantic-class",
+        action="append",
+        default=[],
+        help="Semantic class to refine with SAM 2. May be passed multiple times.",
+    )
+    refine_parser.add_argument(
+        "--sam2-roof-box-fraction",
+        type=float,
+        default=0.55,
+        help="Fraction of the down-face width/height covered by the default roof prompt box.",
+    )
+    refine_parser.add_argument(
+        "--disable-temporal-propagation",
+        action="store_true",
+        help="Disable adjacent-frame prior-mask prompting.",
+    )
+    refine_parser.add_argument(
+        "--sam2-temporal-iou-threshold",
+        type=float,
+        default=0.45,
+        help="Minimum box IoU required to use adjacent-frame prior masks for non-roof prompts.",
+    )
+    refine_parser.add_argument(
+        "--sam2-temporal-area-ratio-min",
+        type=float,
+        default=0.5,
+        help="Minimum current/prior box area ratio for temporal prior stability.",
+    )
+    refine_parser.add_argument(
+        "--sam2-temporal-area-ratio-max",
+        type=float,
+        default=2.0,
+        help="Maximum current/prior box area ratio for temporal prior stability.",
+    )
+    refine_parser.add_argument(
+        "--sam2-temporal-max-gap",
+        type=int,
+        default=1,
+        help="Maximum adjacent-frame gap allowed for temporal prior masks.",
+    )
     return parser
 
 
@@ -527,6 +666,85 @@ def handle_detect_dynamic(args: argparse.Namespace) -> int:
     return 0 if summary["failed_sequences"] == 0 else 1
 
 
+def handle_refine_masks(args: argparse.Namespace) -> int:
+    semantic_classes = (
+        tuple(args.sam2_semantic_class)
+        if args.sam2_semantic_class
+        else DEFAULT_SAM2_SEMANTIC_PROMPT_CLASSES
+    )
+    config = IndexConfig(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        min_valid_frames=args.min_valid_frames,
+        dry_run=args.dry_run,
+        compute_checksums=not args.skip_checksum,
+        cube_face_size=args.cube_face_size,
+        cube_overlap_px=args.cube_overlap_px,
+        cache_cubemap_faces=not args.skip_face_cache,
+        sam2_model_id=args.sam2_model_id,
+        sam2_device=args.sam2_device,
+        sam2_local_files_only=args.sam2_local_files_only,
+        sam2_mask_threshold=args.sam2_mask_threshold,
+        sam2_min_mask_area_px=args.sam2_min_mask_area_px,
+        sam2_refine_grounding=not args.skip_grounding_prompts,
+        sam2_refine_semantic=not args.skip_semantic_prompts,
+        sam2_refine_roof=not args.skip_roof_prompt,
+        sam2_semantic_prompt_classes=semantic_classes,
+        sam2_roof_box_fraction=args.sam2_roof_box_fraction,
+        sam2_temporal_propagation=not args.disable_temporal_propagation,
+        sam2_temporal_iou_threshold=args.sam2_temporal_iou_threshold,
+        sam2_temporal_area_ratio_min=args.sam2_temporal_area_ratio_min,
+        sam2_temporal_area_ratio_max=args.sam2_temporal_area_ratio_max,
+        sam2_temporal_max_gap=args.sam2_temporal_max_gap,
+    )
+    manifests = run_sam2_refinement(config, sequence_ids=args.sequence or None)
+    summary = {
+        "dataset_root": str(config.dataset_root),
+        "output_root": str(config.output_root),
+        "dry_run": config.dry_run,
+        "compute_checksums": config.compute_checksums,
+        "cube_face_size": config.cube_face_size,
+        "cube_overlap_px": config.cube_overlap_px,
+        "cache_cubemap_faces": config.cache_cubemap_faces,
+        "sam2_model_id": config.sam2_model_id,
+        "sam2_device": config.sam2_device,
+        "sam2_local_files_only": config.sam2_local_files_only,
+        "sam2_mask_threshold": config.sam2_mask_threshold,
+        "sam2_min_mask_area_px": config.sam2_min_mask_area_px,
+        "sam2_refine_grounding": config.sam2_refine_grounding,
+        "sam2_refine_semantic": config.sam2_refine_semantic,
+        "sam2_refine_roof": config.sam2_refine_roof,
+        "sam2_semantic_prompt_classes": list(config.sam2_semantic_prompt_classes),
+        "sam2_temporal_propagation": config.sam2_temporal_propagation,
+        "sam2_temporal_iou_threshold": config.sam2_temporal_iou_threshold,
+        "sam2_temporal_area_ratio_min": config.sam2_temporal_area_ratio_min,
+        "sam2_temporal_area_ratio_max": config.sam2_temporal_area_ratio_max,
+        "sam2_temporal_max_gap": config.sam2_temporal_max_gap,
+        "sequence_count": len(manifests),
+        "refined_sequences": sum(1 for item in manifests if item.status == "ready"),
+        "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
+        "refined_frames": sum(
+            sum(1 for row in item.rows if row.sam2_refine_status == "refined")
+            for item in manifests
+        ),
+        "failed_frames": sum(
+            sum(1 for row in item.rows if row.sam2_refine_status == "failed")
+            for item in manifests
+        ),
+        "total_masks": sum(
+            sum((row.sam2_mask_count or 0) for row in item.rows if row.sam2_refine_status == "refined")
+            for item in manifests
+        ),
+        "total_temporal_priors": sum(
+            sum((row.sam2_temporal_prior_count or 0) for row in item.rows if row.sam2_refine_status == "refined")
+            for item in manifests
+        ),
+        "sequences": [item.to_summary_dict() for item in manifests],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["failed_sequences"] == 0 else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -540,6 +758,8 @@ def main() -> int:
         return handle_parse_semantic(args)
     if args.command == "detect-dynamic":
         return handle_detect_dynamic(args)
+    if args.command == "refine-masks":
+        return handle_refine_masks(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
