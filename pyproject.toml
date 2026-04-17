@@ -19,6 +19,14 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0"
 ]
+semantic = [
+  "torch>=2.2",
+  "transformers>=5.5",
+]
+ml = [
+  "torch>=2.2",
+  "transformers>=5.5",
+]
 
 [project.scripts]
 urpan-inpaint = "urpan_inpaint.cli.main:main"

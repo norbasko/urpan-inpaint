@@ -16,3 +16,9 @@ class IndexConfig:
     cube_face_size: int = 1536
     cube_overlap_px: int = 64
     cache_cubemap_faces: bool = True
+    semantic_model_id: str = "facebook/mask2former-swin-tiny-cityscapes-semantic"
+    semantic_device: str = "auto"
+    semantic_local_files_only: bool = False
+    semantic_save_logits: bool = False
+    semantic_save_confidence: bool = True
+    semantic_attempt_panoptic: bool = True

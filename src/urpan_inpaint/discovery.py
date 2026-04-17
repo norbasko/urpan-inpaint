@@ -264,6 +264,13 @@ def write_sequence_manifest(manifest: SequenceManifest) -> None:
             "cubemap_metadata_path",
             "cubemap_projection_status",
             "cubemap_projection_error",
+            "semantic_model_id",
+            "semantic_output_dir",
+            "semantic_has_panoptic",
+            "semantic_has_confidence",
+            "semantic_has_logits",
+            "semantic_parse_status",
+            "semantic_parse_error",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

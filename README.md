@@ -23,11 +23,23 @@ This implementation currently covers:
   - add guard-band overlap on all faces,
   - retain exact inverse-reprojection metadata alongside each cached face tensor,
   - optionally cache face tensors as `.npz` files under each frame's cubemap cache directory.
+- Semantic / panoptic parsing:
+  - run Mask2Former on cubemap faces,
+  - write per-face semantic label maps and required-class coarse masks,
+  - write confidence maps when available,
+  - write panoptic instance maps and segment sidecars when available,
+  - use a Cityscapes Mask2Former checkpoint by default and continue even if only semantic outputs are available.
 
 ## Install
 
 ```bash
 python3 -m pip install -e .
+```
+
+For Mask2Former, install the optional ML runtime in the `urpan-inpaint` environment:
+
+```bash
+python3 -m pip install -e ".[ml]"
 ```
 
 ## Usage
@@ -85,6 +97,24 @@ urpan-inpaint project-cubemap \
   --skip-checksum
 ```
 
+Run Mask2Former semantic parsing on cube faces:
+
+```bash
+urpan-inpaint parse-semantic \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --semantic-model-id facebook/mask2former-swin-tiny-cityscapes-semantic
+```
+
+Restrict semantic parsing to locally cached checkpoint files:
+
+```bash
+urpan-inpaint parse-semantic \
+  --semantic-local-files-only \
+  --skip-panoptic
+```
+
+
 ## Output layout
 
 For each sequence `GSxxxxxx`, the pipeline writes:
@@ -109,3 +139,21 @@ For each sequence `GSxxxxxx`, the pipeline writes:
 ```
 
 No normalized intermediate image files are written during ERP normalization. The canonical JPEGs remain untouched until a later final-write path emits RGB or RGBA outputs.
+
+Semantic face outputs are written under each frame's cubemap cache directory:
+
+```text
+<output-root>/GSxxxxxx/cubemap/GSxxxxxx-frame-YYYYYY/
+  projection.json
+  front.npz
+  right.npz
+  back.npz
+  left.npz
+  up.npz
+  down.npz
+  semantic_mask2former/
+    metadata.json
+    front.npz
+    front.panoptic.json
+    ...
+```

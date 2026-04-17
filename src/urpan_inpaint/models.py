@@ -65,6 +65,13 @@ class FrameRecord:
     cubemap_metadata_path: Optional[Path] = None
     cubemap_projection_status: str = "pending"
     cubemap_projection_error: str = ""
+    semantic_model_id: str = ""
+    semantic_output_dir: Optional[Path] = None
+    semantic_has_panoptic: bool = False
+    semantic_has_confidence: bool = False
+    semantic_has_logits: bool = False
+    semantic_parse_status: str = "pending"
+    semantic_parse_error: str = ""
 
     def to_manifest_row(self) -> dict[str, str]:
         return {
@@ -114,6 +121,13 @@ class FrameRecord:
             "cubemap_metadata_path": "" if self.cubemap_metadata_path is None else str(self.cubemap_metadata_path),
             "cubemap_projection_status": self.cubemap_projection_status,
             "cubemap_projection_error": self.cubemap_projection_error,
+            "semantic_model_id": self.semantic_model_id,
+            "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
+            "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
+            "semantic_has_confidence": "1" if self.semantic_has_confidence else "0",
+            "semantic_has_logits": "1" if self.semantic_has_logits else "0",
+            "semantic_parse_status": self.semantic_parse_status,
+            "semantic_parse_error": self.semantic_parse_error,
         }
 
 
@@ -142,6 +156,10 @@ class SequenceManifest:
         projection_failed_frames = [
             row.frame_name for row in self.rows if row.cubemap_projection_status == "failed"
         ]
+        parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
+        semantic_failed_frames = [
+            row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
+        ]
         return {
             "sequence_id": self.sequence_id,
             "sequence_dir": str(self.sequence_dir),
@@ -159,5 +177,7 @@ class SequenceManifest:
             "normalization_failed_frames": normalization_failed_frames,
             "projected_frames": projected_frames,
             "projection_failed_frames": projection_failed_frames,
+            "parsed_frames": parsed_frames,
+            "semantic_failed_frames": semantic_failed_frames,
             "required_csv_fields": list(REQUIRED_CSV_FIELDS),
         }

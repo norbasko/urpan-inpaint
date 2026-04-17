@@ -31,6 +31,19 @@ class CubemapProjection:
     faces: dict[str, CubemapFace]
 
 
+def cubemap_metadata_path(cache_dir: Path) -> Path:
+    return cache_dir / "projection.json"
+
+
+def cubemap_face_path(cache_dir: Path, face_name: str) -> Path:
+    return cache_dir / f"{face_name}.npz"
+
+
+def cubemap_cache_exists(cache_dir: Path) -> bool:
+    metadata = cubemap_metadata_path(cache_dir)
+    return metadata.is_file() and all(cubemap_face_path(cache_dir, face_name).is_file() for face_name in FACE_ORDER)
+
+
 def _face_coordinate_grid(face_size: int, overlap_px: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     total_face_size = face_size + (2 * overlap_px)
     coords = (((np.arange(total_face_size, dtype=np.float32) + 0.5) - overlap_px) / face_size) * 2.0 - 1.0
@@ -204,7 +217,7 @@ def cubemap_to_erp(
 def save_cubemap_projection(projection: CubemapProjection, cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_path = cache_dir / "projection.json"
+    metadata_path = cubemap_metadata_path(cache_dir)
     metadata = {
         "erp_width": projection.erp_width,
         "erp_height": projection.erp_height,
@@ -218,7 +231,7 @@ def save_cubemap_projection(projection: CubemapProjection, cache_dir: Path) -> P
 
     for face_name, face in projection.faces.items():
         np.savez_compressed(
-            cache_dir / f"{face_name}.npz",
+            cubemap_face_path(cache_dir, face_name),
             rgb=face.rgb,
             erp_x=face.erp_x,
             erp_y=face.erp_y,
@@ -229,10 +242,10 @@ def save_cubemap_projection(projection: CubemapProjection, cache_dir: Path) -> P
 
 
 def load_cubemap_projection(cache_dir: Path) -> CubemapProjection:
-    metadata = json.loads((cache_dir / "projection.json").read_text(encoding="utf-8"))
+    metadata = json.loads(cubemap_metadata_path(cache_dir).read_text(encoding="utf-8"))
     faces: dict[str, CubemapFace] = {}
     for face_name in metadata["face_order"]:
-        with np.load(cache_dir / f"{face_name}.npz") as payload:
+        with np.load(cubemap_face_path(cache_dir, face_name)) as payload:
             faces[face_name] = CubemapFace(
                 name=face_name,
                 rgb=payload["rgb"],
@@ -249,3 +262,16 @@ def load_cubemap_projection(cache_dir: Path) -> CubemapProjection:
         total_face_size=int(metadata["total_face_size"]),
         faces=faces,
     )
+
+
+def load_cubemap_metadata(cache_dir: Path) -> dict[str, object]:
+    return json.loads(cubemap_metadata_path(cache_dir).read_text(encoding="utf-8"))
+
+
+def load_cubemap_face_rgbs(cache_dir: Path) -> dict[str, np.ndarray]:
+    metadata = load_cubemap_metadata(cache_dir)
+    face_rgbs: dict[str, np.ndarray] = {}
+    for face_name in metadata["face_order"]:
+        with np.load(cubemap_face_path(cache_dir, face_name)) as payload:
+            face_rgbs[face_name] = payload["rgb"]
+    return face_rgbs

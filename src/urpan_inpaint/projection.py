@@ -4,33 +4,30 @@ from dataclasses import replace
 from typing import Iterable, Optional
 
 from urpan_inpaint.config import IndexConfig
-from urpan_inpaint.cubemap import erp_to_cubemap, save_cubemap_projection
+from urpan_inpaint.cubemap import (
+    cubemap_cache_exists,
+    cubemap_metadata_path,
+    erp_to_cubemap,
+    load_cubemap_face_rgbs,
+    load_cubemap_metadata,
+    save_cubemap_projection,
+)
 from urpan_inpaint.discovery import run_indexing, write_sequence_manifest
 from urpan_inpaint.erp import load_erp_rgb
 from urpan_inpaint.models import FrameRecord, SequenceManifest
 
 
-def project_frame_record(frame: FrameRecord, config: IndexConfig) -> FrameRecord:
+def _project_frame(
+    frame: FrameRecord,
+    config: IndexConfig,
+) -> tuple[FrameRecord, object]:
     if not frame.file_exists:
-        return replace(
-            frame,
-            erp_normalization_status="skipped_missing_source",
-            erp_normalization_error="Referenced fixed frame is missing",
-            cubemap_projection_status="skipped_missing_source",
-            cubemap_projection_error="Referenced fixed frame is missing",
-        )
+        raise RuntimeError("Referenced fixed frame is missing")
 
     try:
         erp = load_erp_rgb(frame.resolved_fixed_path, compute_checksum=config.compute_checksums)
     except Exception as exc:
-        error = str(exc)
-        return replace(
-            frame,
-            erp_normalization_status="failed",
-            erp_normalization_error=error,
-            cubemap_projection_status="failed",
-            cubemap_projection_error=error,
-        )
+        raise RuntimeError(str(exc)) from exc
 
     normalized_frame = replace(
         frame,
@@ -44,13 +41,40 @@ def project_frame_record(frame: FrameRecord, config: IndexConfig) -> FrameRecord
         erp_normalization_status="normalized",
         erp_normalization_error="",
     )
+    projection = erp_to_cubemap(
+        erp,
+        face_size=config.cube_face_size,
+        overlap_px=config.cube_overlap_px,
+    )
+    return normalized_frame, projection
+
+
+def project_frame_record(
+    frame: FrameRecord,
+    config: IndexConfig,
+) -> FrameRecord:
+    if not frame.file_exists:
+        return replace(
+            frame,
+            erp_normalization_status="skipped_missing_source",
+            erp_normalization_error="Referenced fixed frame is missing",
+            cubemap_projection_status="skipped_missing_source",
+            cubemap_projection_error="Referenced fixed frame is missing",
+        )
 
     try:
-        projection = erp_to_cubemap(
-            erp,
-            face_size=config.cube_face_size,
-            overlap_px=config.cube_overlap_px,
+        normalized_frame, projection = _project_frame(frame, config)
+    except Exception as exc:
+        error = str(exc)
+        return replace(
+            frame,
+            erp_normalization_status="failed",
+            erp_normalization_error=error,
+            cubemap_projection_status="failed",
+            cubemap_projection_error=error,
         )
+
+    try:
         metadata_path = None
         if not config.dry_run and config.cache_cubemap_faces:
             metadata_path = save_cubemap_projection(projection, normalized_frame.cubemap_cache_dir)
@@ -75,6 +99,52 @@ def project_frame_record(frame: FrameRecord, config: IndexConfig) -> FrameRecord
         cubemap_projection_status="projected",
         cubemap_projection_error="",
     )
+
+
+def load_or_create_cubemap_face_rgbs(
+    frame: FrameRecord,
+    config: IndexConfig,
+) -> tuple[FrameRecord, dict[str, object], dict[str, object]]:
+    if cubemap_cache_exists(frame.cubemap_cache_dir):
+        metadata = load_cubemap_metadata(frame.cubemap_cache_dir)
+        face_rgbs = load_cubemap_face_rgbs(frame.cubemap_cache_dir)
+        updated_frame = replace(
+            frame,
+            cubemap_face_size=int(metadata["face_size"]),
+            cubemap_overlap_px=int(metadata["overlap_px"]),
+            cubemap_total_face_size=int(metadata["total_face_size"]),
+            cubemap_face_cache_format=str(metadata.get("face_cache_format", "npz")),
+            cubemap_faces_cached=True,
+            cubemap_metadata_path=cubemap_metadata_path(frame.cubemap_cache_dir),
+            cubemap_projection_status="projected",
+            cubemap_projection_error="",
+        )
+        return updated_frame, metadata, face_rgbs
+
+    normalized_frame, projection = _project_frame(frame, config)
+    metadata_path = None
+    if not config.dry_run and config.cache_cubemap_faces:
+        metadata_path = save_cubemap_projection(projection, normalized_frame.cubemap_cache_dir)
+    projected_frame = replace(
+        normalized_frame,
+        cubemap_face_size=projection.face_size,
+        cubemap_overlap_px=projection.overlap_px,
+        cubemap_total_face_size=projection.total_face_size,
+        cubemap_face_cache_format="npz" if config.cache_cubemap_faces else "",
+        cubemap_faces_cached=config.cache_cubemap_faces and not config.dry_run,
+        cubemap_metadata_path=metadata_path,
+        cubemap_projection_status="projected",
+        cubemap_projection_error="",
+    )
+    metadata = {
+        "face_size": projection.face_size,
+        "overlap_px": projection.overlap_px,
+        "total_face_size": projection.total_face_size,
+        "face_order": list(projection.faces.keys()),
+        "face_cache_format": "npz",
+    }
+    face_rgbs = {face_name: face.rgb for face_name, face in projection.faces.items()}
+    return projected_frame, metadata, face_rgbs
 
 
 def project_sequence_cubemap(sequence_manifest: SequenceManifest, config: IndexConfig) -> SequenceManifest:
