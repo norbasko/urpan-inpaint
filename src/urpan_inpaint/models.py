@@ -65,6 +65,11 @@ class FrameRecord:
     cubemap_metadata_path: Optional[Path] = None
     cubemap_projection_status: str = "pending"
     cubemap_projection_error: str = ""
+    roof_mask_status: str = "pending"
+    roof_mask_source: str = ""
+    roof_mask_area_px: Optional[int] = None
+    roof_mask_temporal_disagreement: bool = False
+    roof_mask_error: str = ""
     semantic_model_id: str = ""
     semantic_output_dir: Optional[Path] = None
     semantic_has_panoptic: bool = False
@@ -132,6 +137,11 @@ class FrameRecord:
             "cubemap_metadata_path": "" if self.cubemap_metadata_path is None else str(self.cubemap_metadata_path),
             "cubemap_projection_status": self.cubemap_projection_status,
             "cubemap_projection_error": self.cubemap_projection_error,
+            "roof_mask_status": self.roof_mask_status,
+            "roof_mask_source": self.roof_mask_source,
+            "roof_mask_area_px": "" if self.roof_mask_area_px is None else str(self.roof_mask_area_px),
+            "roof_mask_temporal_disagreement": "1" if self.roof_mask_temporal_disagreement else "0",
+            "roof_mask_error": self.roof_mask_error,
             "semantic_model_id": self.semantic_model_id,
             "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
             "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
@@ -180,6 +190,13 @@ class SequenceManifest:
         projection_failed_frames = [
             row.frame_name for row in self.rows if row.cubemap_projection_status == "failed"
         ]
+        roof_mask_frames = sum(1 for row in self.rows if row.roof_mask_status in {"generated", "fallback"})
+        roof_fallback_frames = [
+            row.frame_name for row in self.rows if row.roof_mask_status == "fallback"
+        ]
+        roof_disagreement_frames = [
+            row.frame_name for row in self.rows if row.roof_mask_temporal_disagreement
+        ]
         parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
         semantic_failed_frames = [
             row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
@@ -209,6 +226,9 @@ class SequenceManifest:
             "normalization_failed_frames": normalization_failed_frames,
             "projected_frames": projected_frames,
             "projection_failed_frames": projection_failed_frames,
+            "roof_mask_frames": roof_mask_frames,
+            "roof_fallback_frames": roof_fallback_frames,
+            "roof_disagreement_frames": roof_disagreement_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,

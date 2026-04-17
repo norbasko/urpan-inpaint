@@ -40,6 +40,12 @@ This implementation currently covers:
   - refine Grounding DINO boxes, semantic region boxes/points, and the explicit down-face roof prompt,
   - refine sky and Cityscapes-style skyline classes when their semantic masks are available,
   - associate stable prompts across neighboring frames and propagate refined masks through SAM 2 memory.
+- Roof mask generation:
+  - build an expanded elliptical nadir prior on the cubemap down face,
+  - refine the current down-face roof candidate with SAM 2 when available,
+  - regularize roof masks with neighboring-frame medians,
+  - emit ERP-space `masks/roof/*.png` masks plus JSON sidecars,
+  - fall back to the temporal median or coarse nadir prior when roof SAM 2 refinement fails.
 
 ## Install
 
@@ -154,6 +160,15 @@ urpan-inpaint refine-masks \
   --sam2-model-id facebook/sam2.1-hiera-tiny
 ```
 
+Tune the roof prior and temporal regularization:
+
+```bash
+urpan-inpaint refine-masks \
+  --sam2-roof-box-fraction 0.55 \
+  --sam2-roof-prior-margin-fraction 0.15 \
+  --sam2-roof-temporal-window 1
+```
+
 Restrict SAM 2 to local checkpoint files and disable temporal prior prompting:
 
 ```bash
@@ -232,3 +247,5 @@ SAM 2 refined masks are written alongside the cubemap cache as:
 ```
 
 Each SAM 2 face `.npz` contains binary `masks`, refined `boxes_xyxy`, `scores`, `class_text`, prompt provenance, and a `used_temporal_prior` flag. The down face is always eligible for the roof prompt unless `--skip-roof-prompt` is passed.
+
+The finalized per-frame roof mask is written to `masks/roof/<frame>.png` in ERP coordinates. Its adjacent JSON sidecar records whether the mask came from current SAM 2 evidence, temporal regularization, temporal fallback, coarse-prior fallback, or a current-vs-temporal disagreement where current evidence was kept.

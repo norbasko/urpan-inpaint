@@ -73,6 +73,9 @@ class IndexConfig:
     sam2_refine_roof: bool = True
     sam2_semantic_prompt_classes: tuple[str, ...] = DEFAULT_SAM2_SEMANTIC_PROMPT_CLASSES
     sam2_roof_box_fraction: float = 0.55
+    sam2_roof_prior_margin_fraction: float = 0.15
+    sam2_roof_temporal_window: int = 1
+    sam2_roof_temporal_disagreement_iou_threshold: float = 0.4
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

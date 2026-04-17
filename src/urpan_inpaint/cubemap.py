@@ -214,6 +214,62 @@ def cubemap_to_erp(
     return result
 
 
+def cubemap_face_mask_to_erp(
+    face_mask: np.ndarray,
+    face_name: str,
+    erp_width: int,
+    erp_height: int,
+    face_size: int,
+    overlap_px: int,
+) -> np.ndarray:
+    """Project one binary cubemap-face mask back into ERP image coordinates."""
+    if face_mask.ndim != 2:
+        raise ValueError("face_mask must be a 2D array")
+
+    x, y, z = _erp_pixel_directions(erp_width, erp_height)
+    abs_x = np.abs(x)
+    abs_y = np.abs(y)
+    abs_z = np.abs(z)
+
+    if face_name == "front":
+        erp_mask = (abs_z > abs_x) & (abs_z > abs_y) & (z > 0)
+        u = x[erp_mask] / abs_z[erp_mask]
+        v = -y[erp_mask] / abs_z[erp_mask]
+    elif face_name == "right":
+        erp_mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x > 0)
+        u = -z[erp_mask] / abs_x[erp_mask]
+        v = -y[erp_mask] / abs_x[erp_mask]
+    elif face_name == "back":
+        erp_mask = (abs_z > abs_x) & (abs_z > abs_y) & (z <= 0)
+        u = -x[erp_mask] / abs_z[erp_mask]
+        v = -y[erp_mask] / abs_z[erp_mask]
+    elif face_name == "left":
+        erp_mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x <= 0)
+        u = z[erp_mask] / abs_x[erp_mask]
+        v = -y[erp_mask] / abs_x[erp_mask]
+    elif face_name == "up":
+        erp_mask = (abs_y > abs_x) & (abs_y >= abs_z) & (y > 0)
+        u = x[erp_mask] / abs_y[erp_mask]
+        v = z[erp_mask] / abs_y[erp_mask]
+    elif face_name == "down":
+        erp_mask = (abs_y > abs_x) & (abs_y >= abs_z) & (y <= 0)
+        u = x[erp_mask] / abs_y[erp_mask]
+        v = -z[erp_mask] / abs_y[erp_mask]
+    else:
+        raise ValueError(f"Unsupported cubemap face: {face_name}")
+
+    result = np.zeros((erp_height, erp_width), dtype=np.uint8)
+    if not np.any(erp_mask):
+        return result
+
+    face_x = ((u + 1.0) * face_size * 0.5) + overlap_px - 0.5
+    face_y = ((v + 1.0) * face_size * 0.5) + overlap_px - 0.5
+    sample_x = np.clip(np.rint(face_x).astype(np.int32), 0, face_mask.shape[1] - 1)
+    sample_y = np.clip(np.rint(face_y).astype(np.int32), 0, face_mask.shape[0] - 1)
+    result[erp_mask] = np.where(face_mask[sample_y, sample_x] > 0, 255, 0).astype(np.uint8)
+    return result
+
+
 def save_cubemap_projection(projection: CubemapProjection, cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
 

@@ -89,6 +89,42 @@ class FakeStreamingSam2Refiner:
         return masks_by_frame, temporal_counts
 
 
+class DisagreeingRoofRefiner(FakeSam2Refiner):
+    model_id = "fake/disagreeing-roof-sam2"
+
+    def refine_face(self, face_name: str, rgb: np.ndarray, prompts):
+        height, width = rgb.shape[:2]
+        refined = []
+        for prompt in prompts:
+            if face_name != "down" or prompt.class_text != "roof":
+                refined.extend(super().refine_face(face_name, rgb, [prompt]))
+                continue
+
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if prompt.used_temporal_prior:
+                mask[:, :] = 255
+            else:
+                cx = width // 2
+                cy = height // 2
+                mask[max(0, cy - 1) : min(height, cy + 1), max(0, cx - 1) : min(width, cx + 1)] = 255
+            bbox = np.asarray([0, 0, width, height], dtype=np.float32)
+            refined.append(
+                RefinedMask(
+                    prompt_id=prompt.prompt_id,
+                    face_name=face_name,
+                    class_text=prompt.class_text,
+                    source=prompt.source,
+                    mask=mask,
+                    box_xyxy=bbox,
+                    score=0.9,
+                    prompt_box_xyxy=prompt.box_xyxy.astype(np.float32),
+                    prompt_score=float(prompt.score),
+                    used_temporal_prior=prompt.used_temporal_prior,
+                )
+            )
+        return refined
+
+
 class RefinementTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -183,6 +219,12 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(frame.sam2_model_id, FakeSam2Refiner.model_id)
         self.assertEqual(frame.sam2_mask_count, 3)
         self.assertEqual(frame.sam2_temporal_prior_count, 0)
+        self.assertEqual(frame.roof_mask_status, "generated")
+        self.assertEqual(frame.roof_mask_source, "sam2_current")
+        self.assertFalse(frame.roof_mask_temporal_disagreement)
+        self.assertTrue(frame.roof_mask_area_px and frame.roof_mask_area_px > 0)
+        self.assertTrue(frame.roof_mask_path.is_file())
+        self.assertTrue(frame.roof_mask_path.with_suffix(".json").is_file())
         self.assertIsNotNone(frame.sam2_output_dir)
 
         output_dir = frame.sam2_output_dir
@@ -215,6 +257,8 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(rows[0]["sam2_model_id"], FakeSam2Refiner.model_id)
         self.assertEqual(rows[0]["sam2_refine_status"], "refined")
         self.assertEqual(rows[0]["sam2_mask_count"], "3")
+        self.assertEqual(rows[0]["roof_mask_status"], "generated")
+        self.assertEqual(rows[0]["roof_mask_source"], "sam2_current")
 
     def test_temporal_propagation_uses_stable_roof_prior(self) -> None:
         sequence_id = "GS999502"
@@ -269,9 +313,35 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(second.sam2_temporal_prior_count, 1)
         self.assertTrue(second.sam2_output_dir and (second.sam2_output_dir / "metadata.json").is_file())
 
+    def test_roof_temporal_disagreement_prefers_current_and_flags_frame(self) -> None:
+        sequence_id = "GS999506"
+        self.write_sequence(sequence_id, frame_count=2)
+
+        manifests = run_sam2_refinement(
+            IndexConfig(
+                dataset_root=self.dataset_root,
+                output_root=self.output_root,
+                min_valid_frames=1,
+                cube_face_size=8,
+                cube_overlap_px=2,
+                cache_cubemap_faces=True,
+                sam2_min_mask_area_px=1,
+                sam2_roof_temporal_disagreement_iou_threshold=0.95,
+            ),
+            refiner=DisagreeingRoofRefiner(),
+        )
+
+        second = manifests[0].rows[1]
+        self.assertEqual(second.roof_mask_status, "generated")
+        self.assertEqual(second.roof_mask_source, "sam2_current_temporal_disagreement")
+        self.assertTrue(second.roof_mask_temporal_disagreement)
+        self.assertIn("kept current evidence", second.roof_mask_error)
+        self.assertTrue(second.roof_mask_path.with_suffix(".json").is_file())
+
     def test_run_sam2_refinement_marks_frame_failures(self) -> None:
         sequence_id = "GS999503"
         self.write_sequence(sequence_id, frame_count=1)
+        self.write_grounding_face(sequence_id, frame_number=1)
 
         manifests = run_sam2_refinement(
             IndexConfig(
@@ -287,6 +357,34 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(manifests[0].status, "failed_sam2_refinement")
         self.assertEqual(manifests[0].rows[0].sam2_refine_status, "failed")
         self.assertIn("intentional SAM 2 failure", manifests[0].rows[0].sam2_refine_error)
+
+    def test_roof_mask_falls_back_to_coarse_prior_when_roof_sam2_fails(self) -> None:
+        sequence_id = "GS999505"
+        self.write_sequence(sequence_id, frame_count=1)
+
+        manifests = run_sam2_refinement(
+            IndexConfig(
+                dataset_root=self.dataset_root,
+                output_root=self.output_root,
+                min_valid_frames=1,
+                cube_face_size=8,
+                cube_overlap_px=2,
+            ),
+            refiner=FailingSam2Refiner(),
+        )
+
+        self.assertEqual(manifests[0].status, "ready")
+        frame = manifests[0].rows[0]
+        self.assertEqual(frame.sam2_refine_status, "refined")
+        self.assertEqual(frame.sam2_mask_count, 0)
+        self.assertIn("roof SAM 2 refinement failed", frame.sam2_refine_error)
+        self.assertEqual(frame.roof_mask_status, "fallback")
+        self.assertEqual(frame.roof_mask_source, "coarse_prior_fallback")
+        self.assertTrue(frame.roof_mask_area_px and frame.roof_mask_area_px > 0)
+        self.assertTrue(frame.roof_mask_path.is_file())
+        roof_mask = np.asarray(Image.open(frame.roof_mask_path))
+        self.assertEqual(roof_mask.shape, (16, 32))
+        self.assertGreater(int((roof_mask > 0).sum()), 0)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from urpan_inpaint.config import IndexConfig
-from urpan_inpaint.cubemap import FACE_ORDER
+from urpan_inpaint.cubemap import FACE_ORDER, cubemap_face_mask_to_erp
 from urpan_inpaint.detection import grounding_output_dir_for_frame
 from urpan_inpaint.discovery import run_indexing, write_sequence_manifest
 from urpan_inpaint.models import FrameRecord, SequenceManifest
@@ -65,6 +65,21 @@ class RefinedMask:
     prompt_box_xyxy: np.ndarray
     prompt_score: float
     used_temporal_prior: bool
+
+
+@dataclass(frozen=True)
+class RoofMaskResult:
+    down_mask: np.ndarray
+    source: str
+    temporal_disagreement: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class FrameRefinementResult:
+    frame: FrameRecord
+    masks: list[RefinedMask]
+    face_shapes: dict[str, tuple[int, int]]
 
 
 @dataclass
@@ -129,6 +144,43 @@ def _clip_box(box_xyxy: np.ndarray, width: int, height: int) -> np.ndarray:
     if box[3] <= box[1]:
         box[3] = min(float(height), box[1] + 1.0)
     return box
+
+
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = mask_a > 0
+    b = mask_b > 0
+    union = int(np.logical_or(a, b).sum())
+    if union == 0:
+        return 1.0
+    return int(np.logical_and(a, b).sum()) / union
+
+
+def _roof_prior_fraction(config: IndexConfig, expanded: bool) -> float:
+    base = float(np.clip(config.sam2_roof_box_fraction, 0.05, 1.0))
+    if not expanded:
+        return base
+    margin = max(0.0, float(config.sam2_roof_prior_margin_fraction))
+    return float(np.clip(base + margin, base, 1.0))
+
+
+def _roof_prior_mask(width: int, height: int, config: IndexConfig, expanded: bool = False) -> np.ndarray:
+    fraction = _roof_prior_fraction(config, expanded=expanded)
+    cx = (width - 1) * 0.5
+    cy = (height - 1) * 0.5
+    rx = max(1.0, width * fraction * 0.5)
+    ry = max(1.0, height * fraction * 0.5)
+    yy, xx = np.ogrid[:height, :width]
+    ellipse = (((xx - cx) / rx) ** 2) + (((yy - cy) / ry) ** 2) <= 1.0
+    return np.where(ellipse, 255, 0).astype(np.uint8)
+
+
+def _regularize_roof_down_mask(mask: np.ndarray, config: IndexConfig) -> np.ndarray:
+    height, width = mask.shape[:2]
+    core_prior = _roof_prior_mask(width, height, config, expanded=False) > 0
+    support = _roof_prior_mask(width, height, config, expanded=True) > 0
+    regularized = np.logical_or(mask > 0, core_prior)
+    regularized = np.logical_and(regularized, support)
+    return np.where(regularized, 255, 0).astype(np.uint8)
 
 
 def _load_grounding_prompts(frame: FrameRecord, face_name: str, width: int, height: int) -> list[Sam2Prompt]:
@@ -202,12 +254,13 @@ def _load_semantic_prompts(
 def _roof_prompt(face_name: str, width: int, height: int, config: IndexConfig) -> list[Sam2Prompt]:
     if face_name != "down" or not config.sam2_refine_roof:
         return []
-    fraction = float(np.clip(config.sam2_roof_box_fraction, 0.05, 1.0))
+    fraction = _roof_prior_fraction(config, expanded=True)
     half_w = width * fraction * 0.5
     half_h = height * fraction * 0.5
     cx = width * 0.5
     cy = height * 0.5
     box = np.asarray([cx - half_w, cy - half_h, cx + half_w, cy + half_h], dtype=np.float32)
+    prior_mask = _roof_prior_mask(width, height, config, expanded=False)
     return [
         Sam2Prompt(
             prompt_id="down:roof:nadir",
@@ -217,6 +270,7 @@ def _roof_prompt(face_name: str, width: int, height: int, config: IndexConfig) -
             box_xyxy=_clip_box(box, width, height),
             score=1.0,
             point_xy=np.asarray([cx, cy], dtype=np.float32),
+            prior_mask=prior_mask,
         )
     ]
 
@@ -268,6 +322,9 @@ class TemporalMaskMemory:
                 prompts_with_priors.append(prompt)
                 continue
             if self._is_stable(prompt, prior, config):
+                prior_mask = prior.mask
+                if prompt.prior_mask is not None:
+                    prior_mask = np.maximum(prompt.prior_mask, prior.mask).astype(np.uint8)
                 prompts_with_priors.append(
                     Sam2Prompt(
                         prompt_id=prompt.prompt_id,
@@ -277,7 +334,7 @@ class TemporalMaskMemory:
                         box_xyxy=prompt.box_xyxy,
                         score=prompt.score,
                         point_xy=prompt.point_xy,
-                        prior_mask=prior.mask,
+                        prior_mask=prior_mask,
                         used_temporal_prior=True,
                     )
                 )
@@ -781,6 +838,9 @@ def _write_sam2_metadata(output_dir: Path, refiner: Any, config: IndexConfig) ->
         "refine_roof": config.sam2_refine_roof,
         "semantic_prompt_classes": list(config.sam2_semantic_prompt_classes),
         "roof_box_fraction": config.sam2_roof_box_fraction,
+        "roof_prior_margin_fraction": config.sam2_roof_prior_margin_fraction,
+        "roof_temporal_window": config.sam2_roof_temporal_window,
+        "roof_temporal_disagreement_iou_threshold": config.sam2_roof_temporal_disagreement_iou_threshold,
         "temporal_propagation": config.sam2_temporal_propagation,
         "temporal_iou_threshold": config.sam2_temporal_iou_threshold,
         "temporal_area_ratio_min": config.sam2_temporal_area_ratio_min,
@@ -792,33 +852,261 @@ def _write_sam2_metadata(output_dir: Path, refiner: Any, config: IndexConfig) ->
     return metadata_path
 
 
-def refine_frame_masks(
+def _extract_roof_candidate(
+    masks: list[RefinedMask],
+    shape: tuple[int, int],
+    config: IndexConfig,
+) -> Optional[np.ndarray]:
+    roof_masks = [
+        mask.mask
+        for mask in masks
+        if mask.face_name == "down" and _normalize_class_text(mask.class_text) == "roof"
+    ]
+    if not roof_masks:
+        return None
+
+    height, width = shape
+    combined = np.zeros((height, width), dtype=np.uint8)
+    for mask in roof_masks:
+        if mask.shape != combined.shape:
+            continue
+        combined = np.maximum(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
+    if int((combined > 0).sum()) < config.sam2_min_mask_area_px:
+        return None
+    return _regularize_roof_down_mask(combined, config)
+
+
+def _temporal_median_roof_mask(
+    candidates: list[Optional[np.ndarray]],
+    frame_index: int,
+    shape: tuple[int, int],
+    config: IndexConfig,
+) -> Optional[np.ndarray]:
+    window = max(0, int(config.sam2_roof_temporal_window))
+    if window == 0:
+        return None
+
+    neighbor_masks: list[np.ndarray] = []
+    start = max(0, frame_index - window)
+    stop = min(len(candidates), frame_index + window + 1)
+    for neighbor_index in range(start, stop):
+        if neighbor_index == frame_index:
+            continue
+        candidate = candidates[neighbor_index]
+        if candidate is not None and candidate.shape == shape:
+            neighbor_masks.append(candidate)
+    if not neighbor_masks:
+        return None
+
+    votes = np.stack([mask > 0 for mask in neighbor_masks], axis=0).sum(axis=0)
+    threshold = max(1, (len(neighbor_masks) + 1) // 2)
+    return np.where(votes >= threshold, 255, 0).astype(np.uint8)
+
+
+def _select_roof_mask_result(
+    candidate: Optional[np.ndarray],
+    temporal_mask: Optional[np.ndarray],
+    shape: tuple[int, int],
+    config: IndexConfig,
+) -> RoofMaskResult:
+    height, width = shape
+    if candidate is None:
+        if temporal_mask is not None:
+            return RoofMaskResult(
+                down_mask=_regularize_roof_down_mask(temporal_mask, config),
+                source="temporal_median_fallback",
+                temporal_disagreement=False,
+            )
+        return RoofMaskResult(
+            down_mask=_roof_prior_mask(width, height, config, expanded=True),
+            source="coarse_prior_fallback",
+            temporal_disagreement=False,
+        )
+
+    candidate = _regularize_roof_down_mask(candidate, config)
+    if temporal_mask is None:
+        return RoofMaskResult(
+            down_mask=candidate,
+            source="sam2_current",
+            temporal_disagreement=False,
+        )
+
+    temporal_mask = _regularize_roof_down_mask(temporal_mask, config)
+    iou = _mask_iou(candidate, temporal_mask)
+    threshold = float(config.sam2_roof_temporal_disagreement_iou_threshold)
+    if iou < threshold:
+        return RoofMaskResult(
+            down_mask=candidate,
+            source="sam2_current_temporal_disagreement",
+            temporal_disagreement=True,
+            error=f"roof temporal median IoU {iou:.3f} below threshold {threshold:.3f}; kept current evidence",
+        )
+
+    return RoofMaskResult(
+        down_mask=_regularize_roof_down_mask(np.maximum(candidate, temporal_mask), config),
+        source="sam2_current_temporal_regularized",
+        temporal_disagreement=False,
+    )
+
+
+def _write_roof_mask_artifacts(
+    frame: FrameRecord,
+    result: RoofMaskResult,
+    config: IndexConfig,
+) -> int:
+    if frame.erp_width is None or frame.erp_height is None:
+        raise RuntimeError("Cannot write roof mask without ERP dimensions")
+    if frame.cubemap_face_size is None or frame.cubemap_overlap_px is None:
+        raise RuntimeError("Cannot write roof mask without cubemap geometry")
+
+    erp_mask = cubemap_face_mask_to_erp(
+        result.down_mask,
+        face_name="down",
+        erp_width=frame.erp_width,
+        erp_height=frame.erp_height,
+        face_size=frame.cubemap_face_size,
+        overlap_px=frame.cubemap_overlap_px,
+    )
+    area_px = int((erp_mask > 0).sum())
+    if config.dry_run:
+        return area_px
+
+    frame.roof_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(erp_mask).save(frame.roof_mask_path)
+    sidecar = {
+        "frame_name": frame.frame_name,
+        "source": result.source,
+        "temporal_disagreement": result.temporal_disagreement,
+        "error": result.error,
+        "down_face_shape": [int(value) for value in result.down_mask.shape],
+        "erp_shape": [int(frame.erp_height), int(frame.erp_width)],
+        "area_px": area_px,
+    }
+    frame.roof_mask_path.with_suffix(".json").write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return area_px
+
+
+def _finalize_roof_masks_for_sequence(
+    rows: list[FrameRecord],
+    masks_by_frame: list[list[RefinedMask]],
+    face_shapes_by_frame: list[dict[str, tuple[int, int]]],
+    config: IndexConfig,
+) -> list[FrameRecord]:
+    if not config.sam2_refine_roof:
+        return [
+            replace(row, roof_mask_status="skipped", roof_mask_source="", roof_mask_error="")
+            for row in rows
+        ]
+
+    candidates: list[Optional[np.ndarray]] = []
+    for frame_index, row in enumerate(rows):
+        shape = face_shapes_by_frame[frame_index].get("down", None)
+        if shape is None:
+            candidates.append(None)
+            continue
+        candidates.append(_extract_roof_candidate(masks_by_frame[frame_index], shape, config))
+
+    finalized_rows: list[FrameRecord] = []
+    for frame_index, row in enumerate(rows):
+        shape = face_shapes_by_frame[frame_index].get("down", None)
+        if shape is None:
+            finalized_rows.append(
+                replace(
+                    row,
+                    roof_mask_status="failed",
+                    roof_mask_source="",
+                    roof_mask_area_px=None,
+                    roof_mask_temporal_disagreement=False,
+                    roof_mask_error="Missing down-face cubemap projection",
+                )
+            )
+            continue
+
+        temporal_mask = _temporal_median_roof_mask(candidates, frame_index, shape, config)
+        result = _select_roof_mask_result(candidates[frame_index], temporal_mask, shape, config)
+        try:
+            area_px = _write_roof_mask_artifacts(row, result, config)
+        except Exception as exc:
+            finalized_rows.append(
+                replace(
+                    row,
+                    roof_mask_status="failed",
+                    roof_mask_source=result.source,
+                    roof_mask_area_px=None,
+                    roof_mask_temporal_disagreement=result.temporal_disagreement,
+                    roof_mask_error=str(exc),
+                )
+            )
+            continue
+
+        status = "fallback" if result.source.endswith("_fallback") else "generated"
+        finalized_rows.append(
+            replace(
+                row,
+                roof_mask_status=status,
+                roof_mask_source=result.source,
+                roof_mask_area_px=area_px,
+                roof_mask_temporal_disagreement=result.temporal_disagreement,
+                roof_mask_error=result.error,
+            )
+        )
+    return finalized_rows
+
+
+def _refine_frame_masks_with_outputs(
     frame: FrameRecord,
     config: IndexConfig,
     refiner: Any,
     memory: TemporalMaskMemory,
     frame_index: int,
-) -> FrameRecord:
+) -> FrameRefinementResult:
     try:
         projected_frame, _, face_rgbs = load_or_create_cubemap_face_rgbs(frame, config)
     except Exception as exc:
-        return replace(
-            frame,
-            sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
-            sam2_refine_status="failed",
-            sam2_refine_error=str(exc),
+        return FrameRefinementResult(
+            frame=replace(
+                frame,
+                sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
+                sam2_refine_status="failed",
+                sam2_refine_error=str(exc),
+            ),
+            masks=[],
+            face_shapes={},
         )
 
     output_dir = sam2_output_dir_for_frame(projected_frame)
     all_masks: list[RefinedMask] = []
+    face_shapes = {face_name: face_rgbs[face_name].shape[:2] for face_name in FACE_ORDER}
     temporal_prior_count = 0
+    roof_warning = ""
     try:
         for face_name in FACE_ORDER:
             rgb = face_rgbs[face_name]
             prompts = collect_face_prompts(projected_frame, face_name, rgb.shape[1], rgb.shape[0], config)
             prompts, face_prior_count = memory.attach_priors(prompts, frame_index, config, face_name=face_name)
             temporal_prior_count += face_prior_count
-            face_masks = refiner.refine_face(face_name, rgb, prompts)
+
+            if face_name == "down":
+                roof_prompts = [
+                    prompt for prompt in prompts
+                    if _normalize_class_text(prompt.class_text) == "roof"
+                ]
+                other_prompts = [
+                    prompt for prompt in prompts
+                    if _normalize_class_text(prompt.class_text) != "roof"
+                ]
+                face_masks = refiner.refine_face(face_name, rgb, other_prompts) if other_prompts else []
+                if roof_prompts:
+                    try:
+                        face_masks.extend(refiner.refine_face(face_name, rgb, roof_prompts))
+                    except Exception as exc:
+                        roof_warning = f"roof SAM 2 refinement failed; roof mask will use fallback: {exc}"
+            else:
+                face_masks = refiner.refine_face(face_name, rgb, prompts) if prompts else []
+
             face_masks = [
                 mask for mask in face_masks if int((mask.mask > 0).sum()) >= config.sam2_min_mask_area_px
             ]
@@ -826,27 +1114,45 @@ def refine_frame_masks(
             if not config.dry_run:
                 _write_face_masks(output_dir, face_name, face_masks, rgb.shape[:2])
     except Exception as exc:
-        return replace(
-            projected_frame,
-            sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
-            sam2_output_dir=output_dir,
-            sam2_refine_status="failed",
-            sam2_refine_error=str(exc),
+        return FrameRefinementResult(
+            frame=replace(
+                projected_frame,
+                sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
+                sam2_output_dir=output_dir,
+                sam2_refine_status="failed",
+                sam2_refine_error=str(exc),
+            ),
+            masks=all_masks,
+            face_shapes=face_shapes,
         )
 
     memory.update(all_masks, frame_index)
     if not config.dry_run:
         _write_sam2_metadata(output_dir, refiner, config)
 
-    return replace(
-        projected_frame,
-        sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
-        sam2_output_dir=output_dir,
-        sam2_mask_count=len(all_masks),
-        sam2_temporal_prior_count=temporal_prior_count,
-        sam2_refine_status="refined",
-        sam2_refine_error="",
+    return FrameRefinementResult(
+        frame=replace(
+            projected_frame,
+            sam2_model_id=getattr(refiner, "model_id", config.sam2_model_id),
+            sam2_output_dir=output_dir,
+            sam2_mask_count=len(all_masks),
+            sam2_temporal_prior_count=temporal_prior_count,
+            sam2_refine_status="refined",
+            sam2_refine_error=roof_warning,
+        ),
+        masks=all_masks,
+        face_shapes=face_shapes,
     )
+
+
+def refine_frame_masks(
+    frame: FrameRecord,
+    config: IndexConfig,
+    refiner: Any,
+    memory: TemporalMaskMemory,
+    frame_index: int,
+) -> FrameRecord:
+    return _refine_frame_masks_with_outputs(frame, config, refiner, memory, frame_index).frame
 
 
 def refine_sequence_masks(sequence_manifest: SequenceManifest, config: IndexConfig, refiner: Any) -> SequenceManifest:
@@ -857,10 +1163,16 @@ def refine_sequence_masks(sequence_manifest: SequenceManifest, config: IndexConf
         return refine_sequence_masks_streaming(sequence_manifest, config, refiner)
 
     memory = TemporalMaskMemory.create()
-    refined_rows = [
-        refine_frame_masks(frame, config, refiner, memory, frame_index)
+    frame_results = [
+        _refine_frame_masks_with_outputs(frame, config, refiner, memory, frame_index)
         for frame_index, frame in enumerate(sequence_manifest.rows)
     ]
+    refined_rows = _finalize_roof_masks_for_sequence(
+        rows=[result.frame for result in frame_results],
+        masks_by_frame=[result.masks for result in frame_results],
+        face_shapes_by_frame=[result.face_shapes for result in frame_results],
+        config=config,
+    )
     failed_rows = [row for row in refined_rows if row.sam2_refine_status == "failed"]
     status = sequence_manifest.status
     failure_reason = sequence_manifest.failure_reason
@@ -912,48 +1224,65 @@ def refine_sequence_masks_streaming(
         frame_face_rgbs.append(face_rgbs)
 
     masks_by_frame: list[list[RefinedMask]] = [[] for _ in sequence_manifest.rows]
+    face_shapes_by_frame: list[dict[str, tuple[int, int]]] = [
+        {} if face_rgbs is None else {face_name: rgb.shape[:2] for face_name, rgb in face_rgbs.items()}
+        for face_rgbs in frame_face_rgbs
+    ]
     streaming_error = ""
-    try:
-        for face_name in FACE_ORDER:
-            face_rgbs_by_frame = [
-                None if face_rgbs is None else face_rgbs[face_name]
-                for face_rgbs in frame_face_rgbs
-            ]
-            prompts_by_frame: list[list[Sam2Prompt]] = []
-            for frame_index, rgb in enumerate(face_rgbs_by_frame):
-                if rgb is None:
-                    prompts_by_frame.append([])
-                    continue
-                prompts_by_frame.append(
-                    collect_face_prompts(
-                        projected_rows[frame_index],
-                        face_name,
-                        rgb.shape[1],
-                        rgb.shape[0],
-                        config,
-                    )
+    roof_streaming_warning = ""
+    for face_name in FACE_ORDER:
+        face_rgbs_by_frame = [
+            None if face_rgbs is None else face_rgbs[face_name]
+            for face_rgbs in frame_face_rgbs
+        ]
+        prompts_by_frame: list[list[Sam2Prompt]] = []
+        for frame_index, rgb in enumerate(face_rgbs_by_frame):
+            if rgb is None:
+                prompts_by_frame.append([])
+                continue
+            prompts_by_frame.append(
+                collect_face_prompts(
+                    projected_rows[frame_index],
+                    face_name,
+                    rgb.shape[1],
+                    rgb.shape[0],
+                    config,
                 )
+            )
+
+        try:
             face_masks_by_frame, _ = refiner.refine_face_sequence(
                 face_name,
                 face_rgbs_by_frame,
                 prompts_by_frame,
                 config,
             )
-            for frame_index, face_masks in enumerate(face_masks_by_frame):
-                masks_by_frame[frame_index].extend(face_masks)
-                rgb = face_rgbs_by_frame[frame_index]
-                if rgb is not None and not config.dry_run:
-                    _write_face_masks(
-                        sam2_output_dir_for_frame(projected_rows[frame_index]),
-                        face_name,
-                        [
-                            mask for mask in face_masks
-                            if int((mask.mask > 0).sum()) >= config.sam2_min_mask_area_px
-                        ],
-                        rgb.shape[:2],
-                    )
-    except Exception as exc:
-        streaming_error = str(exc)
+        except Exception as exc:
+            has_non_roof_prompt = any(
+                _normalize_class_text(prompt.class_text) != "roof"
+                for prompts in prompts_by_frame
+                for prompt in prompts
+            )
+            if face_name == "down" and not has_non_roof_prompt and config.sam2_refine_roof:
+                roof_streaming_warning = f"roof SAM 2 video refinement failed; roof mask will use fallback: {exc}"
+                face_masks_by_frame = [[] for _ in face_rgbs_by_frame]
+            else:
+                streaming_error = str(exc)
+                break
+
+        for frame_index, face_masks in enumerate(face_masks_by_frame):
+            masks_by_frame[frame_index].extend(face_masks)
+            rgb = face_rgbs_by_frame[frame_index]
+            if rgb is not None and not config.dry_run:
+                _write_face_masks(
+                    sam2_output_dir_for_frame(projected_rows[frame_index]),
+                    face_name,
+                    [
+                        mask for mask in face_masks
+                        if int((mask.mask > 0).sum()) >= config.sam2_min_mask_area_px
+                    ],
+                    rgb.shape[:2],
+                )
 
     refined_rows: list[FrameRecord] = []
     for frame_index, frame in enumerate(projected_rows):
@@ -987,9 +1316,16 @@ def refine_sequence_masks_streaming(
                 sam2_mask_count=len(frame_masks),
                 sam2_temporal_prior_count=frame_temporal_count,
                 sam2_refine_status="refined",
-                sam2_refine_error="",
+                sam2_refine_error=roof_streaming_warning,
             )
         )
+
+    refined_rows = _finalize_roof_masks_for_sequence(
+        rows=refined_rows,
+        masks_by_frame=masks_by_frame,
+        face_shapes_by_frame=face_shapes_by_frame,
+        config=config,
+    )
 
     failed_rows = [row for row in refined_rows if row.sam2_refine_status == "failed"]
     status = sequence_manifest.status

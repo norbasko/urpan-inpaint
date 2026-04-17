@@ -438,7 +438,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--sam2-roof-box-fraction",
         type=float,
         default=0.55,
-        help="Fraction of the down-face width/height covered by the default roof prompt box.",
+        help="Base fraction of the down-face width/height covered by the nadir roof prior.",
+    )
+    refine_parser.add_argument(
+        "--sam2-roof-prior-margin-fraction",
+        type=float,
+        default=0.15,
+        help="Additional radial fraction used to expand the roof prompt/support region.",
+    )
+    refine_parser.add_argument(
+        "--sam2-roof-temporal-window",
+        type=int,
+        default=1,
+        help="Neighboring-frame radius used for temporal roof-mask median regularization and fallback.",
+    )
+    refine_parser.add_argument(
+        "--sam2-roof-temporal-disagreement-iou-threshold",
+        type=float,
+        default=0.4,
+        help="Flag roof masks below this IoU with the neighboring-frame median and keep current evidence.",
     )
     refine_parser.add_argument(
         "--disable-temporal-propagation",
@@ -691,6 +709,9 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         sam2_refine_roof=not args.skip_roof_prompt,
         sam2_semantic_prompt_classes=semantic_classes,
         sam2_roof_box_fraction=args.sam2_roof_box_fraction,
+        sam2_roof_prior_margin_fraction=args.sam2_roof_prior_margin_fraction,
+        sam2_roof_temporal_window=args.sam2_roof_temporal_window,
+        sam2_roof_temporal_disagreement_iou_threshold=args.sam2_roof_temporal_disagreement_iou_threshold,
         sam2_temporal_propagation=not args.disable_temporal_propagation,
         sam2_temporal_iou_threshold=args.sam2_temporal_iou_threshold,
         sam2_temporal_area_ratio_min=args.sam2_temporal_area_ratio_min,
@@ -715,6 +736,12 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         "sam2_refine_semantic": config.sam2_refine_semantic,
         "sam2_refine_roof": config.sam2_refine_roof,
         "sam2_semantic_prompt_classes": list(config.sam2_semantic_prompt_classes),
+        "sam2_roof_box_fraction": config.sam2_roof_box_fraction,
+        "sam2_roof_prior_margin_fraction": config.sam2_roof_prior_margin_fraction,
+        "sam2_roof_temporal_window": config.sam2_roof_temporal_window,
+        "sam2_roof_temporal_disagreement_iou_threshold": (
+            config.sam2_roof_temporal_disagreement_iou_threshold
+        ),
         "sam2_temporal_propagation": config.sam2_temporal_propagation,
         "sam2_temporal_iou_threshold": config.sam2_temporal_iou_threshold,
         "sam2_temporal_area_ratio_min": config.sam2_temporal_area_ratio_min,
@@ -737,6 +764,18 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         ),
         "total_temporal_priors": sum(
             sum((row.sam2_temporal_prior_count or 0) for row in item.rows if row.sam2_refine_status == "refined")
+            for item in manifests
+        ),
+        "roof_masks": sum(
+            sum(1 for row in item.rows if row.roof_mask_status in {"generated", "fallback"})
+            for item in manifests
+        ),
+        "roof_fallbacks": sum(
+            sum(1 for row in item.rows if row.roof_mask_status == "fallback")
+            for item in manifests
+        ),
+        "roof_temporal_disagreements": sum(
+            sum(1 for row in item.rows if row.roof_mask_temporal_disagreement)
             for item in manifests
         ),
         "sequences": [item.to_summary_dict() for item in manifests],
