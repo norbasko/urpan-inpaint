@@ -8,6 +8,7 @@ from urpan_inpaint.config import DEFAULT_GROUNDING_DINO_PROMPTS, DEFAULT_SAM2_SE
 from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.detection import run_grounding_detection
 from urpan_inpaint.discovery import run_indexing
+from urpan_inpaint.fusion import run_mask_fusion
 from urpan_inpaint.normalization import run_erp_normalization
 from urpan_inpaint.projection import run_cubemap_projection
 from urpan_inpaint.refinement import run_sam2_refinement
@@ -511,6 +512,104 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Maximum adjacent-frame gap allowed for temporal prior masks.",
     )
+
+    fusion_parser = subparsers.add_parser(
+        "fuse-masks",
+        help="Fuse parser, Grounding DINO/SAM 2, roof, and sky masks into final dynamic/roof/sky/inpaint masks.",
+    )
+    fusion_parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust"),
+        help="Dataset root containing GS* sequence directories.",
+    )
+    fusion_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust/inpaint"),
+        help="Output root for manifests and pipeline artifacts.",
+    )
+    fusion_parser.add_argument(
+        "--sequence",
+        action="append",
+        default=[],
+        help="Sequence ID to process. May be passed multiple times.",
+    )
+    fusion_parser.add_argument(
+        "--min-valid-frames",
+        type=int,
+        default=3,
+        help="Minimum valid frames required for a sequence to remain eligible.",
+    )
+    fusion_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fuse masks without writing output files.",
+    )
+    fusion_parser.add_argument(
+        "--skip-checksum",
+        action="store_true",
+        help="Skip SHA-256 computation if cubemap projection cache is missing.",
+    )
+    fusion_parser.add_argument(
+        "--cube-face-size",
+        type=int,
+        default=1536,
+        help="Inner cubemap face size in pixels when projection cache is missing.",
+    )
+    fusion_parser.add_argument(
+        "--cube-overlap-px",
+        type=int,
+        default=64,
+        help="Guard-band overlap on all cubemap faces when projection cache is missing.",
+    )
+    fusion_parser.add_argument(
+        "--skip-face-cache",
+        action="store_true",
+        help="Keep projected face tensors in memory only if cubemap cache is missing.",
+    )
+    fusion_parser.add_argument(
+        "--dyn-min-component-area-px",
+        type=int,
+        default=64,
+        help="Drop dynamic components smaller than this after hole filling.",
+    )
+    fusion_parser.add_argument(
+        "--roof-min-component-area-px",
+        type=int,
+        default=256,
+        help="Drop roof components smaller than this after hole filling.",
+    )
+    fusion_parser.add_argument(
+        "--dyn-dilate-px",
+        type=int,
+        default=3,
+        help="Dynamic-mask edge dilation radius in pixels.",
+    )
+    fusion_parser.add_argument(
+        "--roof-dilate-px",
+        type=int,
+        default=5,
+        help="Roof-mask edge dilation radius in pixels.",
+    )
+    fusion_parser.add_argument(
+        "--dyn-erode-after-dilate-px",
+        type=int,
+        default=0,
+        help="Optional dynamic-mask erosion after dilation when expansion is excessive.",
+    )
+    fusion_parser.add_argument(
+        "--roof-erode-after-dilate-px",
+        type=int,
+        default=0,
+        help="Optional roof-mask erosion after dilation when expansion is excessive.",
+    )
+    fusion_parser.add_argument(
+        "--sky-mask-erp-smoothing-iterations",
+        type=int,
+        default=1,
+        help="Seam-aware smoothing iterations for the refined sky mask.",
+    )
     return parser
 
 
@@ -824,6 +923,73 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
     return 0 if summary["failed_sequences"] == 0 else 1
 
 
+def handle_fuse_masks(args: argparse.Namespace) -> int:
+    config = IndexConfig(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        min_valid_frames=args.min_valid_frames,
+        dry_run=args.dry_run,
+        compute_checksums=not args.skip_checksum,
+        cube_face_size=args.cube_face_size,
+        cube_overlap_px=args.cube_overlap_px,
+        cache_cubemap_faces=not args.skip_face_cache,
+        dyn_min_component_area_px=args.dyn_min_component_area_px,
+        roof_min_component_area_px=args.roof_min_component_area_px,
+        dyn_dilate_px=args.dyn_dilate_px,
+        roof_dilate_px=args.roof_dilate_px,
+        dyn_erode_after_dilate_px=args.dyn_erode_after_dilate_px,
+        roof_erode_after_dilate_px=args.roof_erode_after_dilate_px,
+        sky_mask_erp_smoothing_iterations=args.sky_mask_erp_smoothing_iterations,
+    )
+    manifests = run_mask_fusion(config, sequence_ids=args.sequence or None)
+    summary = {
+        "dataset_root": str(config.dataset_root),
+        "output_root": str(config.output_root),
+        "dry_run": config.dry_run,
+        "compute_checksums": config.compute_checksums,
+        "cube_face_size": config.cube_face_size,
+        "cube_overlap_px": config.cube_overlap_px,
+        "cache_cubemap_faces": config.cache_cubemap_faces,
+        "dyn_min_component_area_px": config.dyn_min_component_area_px,
+        "roof_min_component_area_px": config.roof_min_component_area_px,
+        "dyn_dilate_px": config.dyn_dilate_px,
+        "roof_dilate_px": config.roof_dilate_px,
+        "dyn_erode_after_dilate_px": config.dyn_erode_after_dilate_px,
+        "roof_erode_after_dilate_px": config.roof_erode_after_dilate_px,
+        "sky_mask_erp_smoothing_iterations": config.sky_mask_erp_smoothing_iterations,
+        "sequence_count": len(manifests),
+        "fused_sequences": sum(1 for item in manifests if item.status == "ready"),
+        "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
+        "fused_frames": sum(
+            sum(1 for row in item.rows if row.mask_fusion_status == "fused")
+            for item in manifests
+        ),
+        "failed_frames": sum(
+            sum(1 for row in item.rows if row.mask_fusion_status == "failed")
+            for item in manifests
+        ),
+        "dynamic_mask_area_px": sum(
+            sum((row.dynamic_mask_area_px or 0) for row in item.rows)
+            for item in manifests
+        ),
+        "roof_mask_area_px": sum(
+            sum((row.roof_mask_area_px or 0) for row in item.rows)
+            for item in manifests
+        ),
+        "sky_mask_area_px": sum(
+            sum((row.sky_mask_area_px or 0) for row in item.rows)
+            for item in manifests
+        ),
+        "inpaint_mask_area_px": sum(
+            sum((row.inpaint_mask_area_px or 0) for row in item.rows)
+            for item in manifests
+        ),
+        "sequences": [item.to_summary_dict() for item in manifests],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["failed_sequences"] == 0 else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -839,6 +1005,8 @@ def main() -> int:
         return handle_detect_dynamic(args)
     if args.command == "refine-masks":
         return handle_refine_masks(args)
+    if args.command == "fuse-masks":
+        return handle_fuse_masks(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 

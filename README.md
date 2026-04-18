@@ -52,6 +52,12 @@ This implementation currently covers:
   - suppress semantic building, tree, vegetation, vehicle, and person masks before compositing,
   - enforce conservative top-connected sky topology on side faces,
   - reproject to ERP and apply seam-aware smoothing without expanding sky into foreground.
+- Mask fusion:
+  - build `DYN_COARSE` from parser dynamic classes,
+  - build `DYN_OVD` from Grounding DINO prompts refined by SAM 2,
+  - apply hole filling, small-component suppression, edge dilation, optional erosion, and temporal consistency to dynamic and roof masks,
+  - seam-smooth the refined sky mask,
+  - write final `dynamic`, `roof`, `sky`, and `inpaint` masks where `INPAINT = (DYN OR ROOF) AND NOT SKY`.
 
 ## Install
 
@@ -192,6 +198,18 @@ urpan-inpaint refine-masks \
   --disable-temporal-propagation
 ```
 
+Fuse final per-frame masks:
+
+```bash
+urpan-inpaint fuse-masks \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --dyn-min-component-area-px 64 \
+  --roof-min-component-area-px 256 \
+  --dyn-dilate-px 3 \
+  --roof-dilate-px 5
+```
+
 ## Output layout
 
 For each sequence `GSxxxxxx`, the pipeline writes:
@@ -266,3 +284,5 @@ Each SAM 2 face `.npz` contains binary `masks`, refined `boxes_xyxy`, `scores`, 
 The finalized per-frame roof mask is written to `masks/roof/<frame>.png` in ERP coordinates. Its adjacent JSON sidecar records whether the mask came from current SAM 2 evidence, temporal regularization, temporal fallback, coarse-prior fallback, or a current-vs-temporal disagreement where current evidence was kept.
 
 The finalized per-frame sky mask is written to `masks/sky/<frame>.png` in ERP coordinates when usable Mask2Former sky predictions exist. Its JSON sidecar records source faces, whether SAM 2 boundary refinement contributed, and the conservative topology/smoothing policy used for alpha compositing.
+
+The fusion stage overwrites final ERP-space masks under `masks/dynamic`, `masks/roof`, `masks/sky`, and `masks/inpaint`, and writes RGB union debug masks under `masks/union_debug`. Fusion JSON sidecars record source terms, morphology settings, warnings for missing inputs, and final mask areas.

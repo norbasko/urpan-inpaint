@@ -74,6 +74,15 @@ class FrameRecord:
     sky_mask_source: str = ""
     sky_mask_area_px: Optional[int] = None
     sky_mask_error: str = ""
+    dynamic_mask_status: str = "pending"
+    dynamic_mask_source: str = ""
+    dynamic_mask_area_px: Optional[int] = None
+    dynamic_mask_error: str = ""
+    inpaint_mask_status: str = "pending"
+    inpaint_mask_area_px: Optional[int] = None
+    inpaint_mask_error: str = ""
+    mask_fusion_status: str = "pending"
+    mask_fusion_error: str = ""
     semantic_model_id: str = ""
     semantic_output_dir: Optional[Path] = None
     semantic_has_panoptic: bool = False
@@ -150,6 +159,15 @@ class FrameRecord:
             "sky_mask_source": self.sky_mask_source,
             "sky_mask_area_px": "" if self.sky_mask_area_px is None else str(self.sky_mask_area_px),
             "sky_mask_error": self.sky_mask_error,
+            "dynamic_mask_status": self.dynamic_mask_status,
+            "dynamic_mask_source": self.dynamic_mask_source,
+            "dynamic_mask_area_px": "" if self.dynamic_mask_area_px is None else str(self.dynamic_mask_area_px),
+            "dynamic_mask_error": self.dynamic_mask_error,
+            "inpaint_mask_status": self.inpaint_mask_status,
+            "inpaint_mask_area_px": "" if self.inpaint_mask_area_px is None else str(self.inpaint_mask_area_px),
+            "inpaint_mask_error": self.inpaint_mask_error,
+            "mask_fusion_status": self.mask_fusion_status,
+            "mask_fusion_error": self.mask_fusion_error,
             "semantic_model_id": self.semantic_model_id,
             "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
             "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
@@ -198,16 +216,21 @@ class SequenceManifest:
         projection_failed_frames = [
             row.frame_name for row in self.rows if row.cubemap_projection_status == "failed"
         ]
-        roof_mask_frames = sum(1 for row in self.rows if row.roof_mask_status in {"generated", "fallback"})
+        roof_mask_frames = sum(1 for row in self.rows if row.roof_mask_status in {"generated", "fallback", "fused"})
         roof_fallback_frames = [
             row.frame_name for row in self.rows if row.roof_mask_status == "fallback"
         ]
         roof_disagreement_frames = [
             row.frame_name for row in self.rows if row.roof_mask_temporal_disagreement
         ]
-        sky_mask_frames = sum(1 for row in self.rows if row.sky_mask_status == "generated")
+        sky_mask_frames = sum(1 for row in self.rows if row.sky_mask_status in {"generated", "fused"})
         sky_empty_frames = [
             row.frame_name for row in self.rows if row.sky_mask_status == "empty"
+        ]
+        dynamic_mask_frames = sum(1 for row in self.rows if row.dynamic_mask_status == "fused")
+        inpaint_mask_frames = sum(1 for row in self.rows if row.inpaint_mask_status == "fused")
+        fusion_failed_frames = [
+            row.frame_name for row in self.rows if row.mask_fusion_status == "failed"
         ]
         parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
         semantic_failed_frames = [
@@ -243,6 +266,9 @@ class SequenceManifest:
             "roof_disagreement_frames": roof_disagreement_frames,
             "sky_mask_frames": sky_mask_frames,
             "sky_empty_frames": sky_empty_frames,
+            "dynamic_mask_frames": dynamic_mask_frames,
+            "inpaint_mask_frames": inpaint_mask_frames,
+            "fusion_failed_frames": fusion_failed_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,

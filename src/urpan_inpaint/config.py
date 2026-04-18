@@ -80,6 +80,12 @@ class IndexConfig:
     sky_mask_sam2_boundary_margin_px: int = 3
     sky_mask_obstacle_dilation_px: int = 1
     sky_mask_erp_smoothing_iterations: int = 1
+    dyn_min_component_area_px: int = 64
+    roof_min_component_area_px: int = 256
+    dyn_dilate_px: int = 3
+    roof_dilate_px: int = 5
+    dyn_erode_after_dilate_px: int = 0
+    roof_erode_after_dilate_px: int = 0
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5
