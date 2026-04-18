@@ -86,6 +86,8 @@ class IndexConfig:
     roof_dilate_px: int = 5
     dyn_erode_after_dilate_px: int = 0
     roof_erode_after_dilate_px: int = 0
+    inpaint_window_size: int = 24
+    inpaint_window_stride: int = 12
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

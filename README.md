@@ -58,6 +58,12 @@ This implementation currently covers:
   - apply hole filling, small-component suppression, edge dilation, optional erosion, and temporal consistency to dynamic and roof masks,
   - seam-smooth the refined sky mask,
   - write final `dynamic`, `roof`, `sky`, and `inpaint` masks where `INPAINT = (DYN OR ROOF) AND NOT SKY`.
+- Temporal windowing for inpainting:
+  - split eligible frames into overlapping sequence windows,
+  - default to `window_size=24` and `window_stride=12`,
+  - support short sequences with a single shorter window,
+  - reconcile overlapping predictions by choosing the window where each frame is closest to the temporal center,
+  - break reconciliation ties deterministically in favor of the earlier window.
 
 ## Install
 
@@ -286,3 +292,5 @@ The finalized per-frame roof mask is written to `masks/roof/<frame>.png` in ERP 
 The finalized per-frame sky mask is written to `masks/sky/<frame>.png` in ERP coordinates when usable Mask2Former sky predictions exist. Its JSON sidecar records source faces, whether SAM 2 boundary refinement contributed, and the conservative topology/smoothing policy used for alpha compositing.
 
 The fusion stage overwrites final ERP-space masks under `masks/dynamic`, `masks/roof`, `masks/sky`, and `masks/inpaint`, and writes RGB union debug masks under `masks/union_debug`. Fusion JSON sidecars record source terms, morphology settings, warnings for missing inputs, and final mask areas.
+
+Temporal inpainting windows are planned by `urpan_inpaint.windowing`. The helper keeps windows overlapping by requiring `inpaint_window_stride < inpaint_window_size`, covers all valid frames, and exposes a reconciliation plan that downstream inpainting runners can use to stitch overlapping window predictions deterministically.
