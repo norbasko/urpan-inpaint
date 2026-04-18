@@ -11,7 +11,7 @@ from PIL import Image
 
 from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.cubemap import FACE_ORDER
-from urpan_inpaint.refinement import RefinedMask, run_sam2_refinement
+from urpan_inpaint.refinement import RefinedMask, _regularize_sky_face_mask, run_sam2_refinement
 
 
 class FakeSam2Refiner:
@@ -225,6 +225,11 @@ class RefinementTests(unittest.TestCase):
         self.assertTrue(frame.roof_mask_area_px and frame.roof_mask_area_px > 0)
         self.assertTrue(frame.roof_mask_path.is_file())
         self.assertTrue(frame.roof_mask_path.with_suffix(".json").is_file())
+        self.assertEqual(frame.sky_mask_status, "generated")
+        self.assertIn("semantic_sam2_boundary", frame.sky_mask_source)
+        self.assertTrue(frame.sky_mask_area_px and frame.sky_mask_area_px > 0)
+        self.assertTrue(frame.sky_mask_path.is_file())
+        self.assertTrue(frame.sky_mask_path.with_suffix(".json").is_file())
         self.assertIsNotNone(frame.sam2_output_dir)
 
         output_dir = frame.sam2_output_dir
@@ -259,6 +264,26 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(rows[0]["sam2_mask_count"], "3")
         self.assertEqual(rows[0]["roof_mask_status"], "generated")
         self.assertEqual(rows[0]["roof_mask_source"], "sam2_current")
+        self.assertEqual(rows[0]["sky_mask_status"], "generated")
+        self.assertTrue(int(rows[0]["sky_mask_area_px"]) > 0)
+
+    def test_sky_regularization_removes_lower_islands_and_semantic_blockers(self) -> None:
+        candidate = np.zeros((12, 10), dtype=np.uint8)
+        candidate[:4, :] = 255
+        candidate[8:10, 4:8] = 255
+        blocker = np.zeros_like(candidate)
+        blocker[:4, 5] = 255
+
+        result = _regularize_sky_face_mask(
+            "front",
+            candidate,
+            blocker,
+            IndexConfig(sky_mask_obstacle_dilation_px=0),
+        )
+
+        self.assertGreater(int((result[:4, :5] > 0).sum()), 0)
+        self.assertEqual(int((result[8:10, :] > 0).sum()), 0)
+        self.assertEqual(int((result[:4, 5] > 0).sum()), 0)
 
     def test_temporal_propagation_uses_stable_roof_prior(self) -> None:
         sequence_id = "GS999502"
@@ -385,6 +410,31 @@ class RefinementTests(unittest.TestCase):
         roof_mask = np.asarray(Image.open(frame.roof_mask_path))
         self.assertEqual(roof_mask.shape, (16, 32))
         self.assertGreater(int((roof_mask > 0).sum()), 0)
+
+    def test_sky_mask_uses_semantic_fallback_when_optional_sam2_fails(self) -> None:
+        sequence_id = "GS999507"
+        self.write_sequence(sequence_id, frame_count=1)
+        self.write_semantic_face(sequence_id, frame_number=1, face_name="up")
+
+        manifests = run_sam2_refinement(
+            IndexConfig(
+                dataset_root=self.dataset_root,
+                output_root=self.output_root,
+                min_valid_frames=1,
+                cube_face_size=8,
+                cube_overlap_px=2,
+            ),
+            refiner=FailingSam2Refiner(),
+        )
+
+        frame = manifests[0].rows[0]
+        self.assertEqual(manifests[0].status, "ready")
+        self.assertEqual(frame.sam2_refine_status, "refined")
+        self.assertIn("sky SAM 2 refinement failed", frame.sam2_refine_error)
+        self.assertEqual(frame.sky_mask_status, "generated")
+        self.assertIn("semantic_mask2former", frame.sky_mask_source)
+        self.assertTrue(frame.sky_mask_area_px and frame.sky_mask_area_px > 0)
+        self.assertTrue(frame.sky_mask_path.is_file())
 
 
 if __name__ == "__main__":

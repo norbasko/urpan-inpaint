@@ -459,6 +459,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Flag roof masks below this IoU with the neighboring-frame median and keep current evidence.",
     )
     refine_parser.add_argument(
+        "--sky-mask-top-seed-fraction",
+        type=float,
+        default=0.12,
+        help="Top face fraction used to seed conservative side-face sky connectivity.",
+    )
+    refine_parser.add_argument(
+        "--sky-mask-sam2-boundary-margin-px",
+        type=int,
+        default=3,
+        help="Pixel radius around Mask2Former sky boundaries where SAM 2 may adjust skyline edges.",
+    )
+    refine_parser.add_argument(
+        "--sky-mask-obstacle-dilation-px",
+        type=int,
+        default=1,
+        help="Dilate semantic non-sky blockers before suppressing sky transparency.",
+    )
+    refine_parser.add_argument(
+        "--sky-mask-erp-smoothing-iterations",
+        type=int,
+        default=1,
+        help="Conservative seam-aware ERP sky-mask smoothing iterations.",
+    )
+    refine_parser.add_argument(
         "--disable-temporal-propagation",
         action="store_true",
         help="Disable adjacent-frame prior-mask prompting.",
@@ -712,6 +736,10 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         sam2_roof_prior_margin_fraction=args.sam2_roof_prior_margin_fraction,
         sam2_roof_temporal_window=args.sam2_roof_temporal_window,
         sam2_roof_temporal_disagreement_iou_threshold=args.sam2_roof_temporal_disagreement_iou_threshold,
+        sky_mask_top_seed_fraction=args.sky_mask_top_seed_fraction,
+        sky_mask_sam2_boundary_margin_px=args.sky_mask_sam2_boundary_margin_px,
+        sky_mask_obstacle_dilation_px=args.sky_mask_obstacle_dilation_px,
+        sky_mask_erp_smoothing_iterations=args.sky_mask_erp_smoothing_iterations,
         sam2_temporal_propagation=not args.disable_temporal_propagation,
         sam2_temporal_iou_threshold=args.sam2_temporal_iou_threshold,
         sam2_temporal_area_ratio_min=args.sam2_temporal_area_ratio_min,
@@ -742,6 +770,10 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         "sam2_roof_temporal_disagreement_iou_threshold": (
             config.sam2_roof_temporal_disagreement_iou_threshold
         ),
+        "sky_mask_top_seed_fraction": config.sky_mask_top_seed_fraction,
+        "sky_mask_sam2_boundary_margin_px": config.sky_mask_sam2_boundary_margin_px,
+        "sky_mask_obstacle_dilation_px": config.sky_mask_obstacle_dilation_px,
+        "sky_mask_erp_smoothing_iterations": config.sky_mask_erp_smoothing_iterations,
         "sam2_temporal_propagation": config.sam2_temporal_propagation,
         "sam2_temporal_iou_threshold": config.sam2_temporal_iou_threshold,
         "sam2_temporal_area_ratio_min": config.sam2_temporal_area_ratio_min,
@@ -776,6 +808,14 @@ def handle_refine_masks(args: argparse.Namespace) -> int:
         ),
         "roof_temporal_disagreements": sum(
             sum(1 for row in item.rows if row.roof_mask_temporal_disagreement)
+            for item in manifests
+        ),
+        "sky_masks": sum(
+            sum(1 for row in item.rows if row.sky_mask_status == "generated")
+            for item in manifests
+        ),
+        "sky_empty_frames": sum(
+            sum(1 for row in item.rows if row.sky_mask_status == "empty")
             for item in manifests
         ),
         "sequences": [item.to_summary_dict() for item in manifests],

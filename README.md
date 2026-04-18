@@ -46,6 +46,12 @@ This implementation currently covers:
   - regularize roof masks with neighboring-frame medians,
   - emit ERP-space `masks/roof/*.png` masks plus JSON sidecars,
   - fall back to the temporal median or coarse nadir prior when roof SAM 2 refinement fails.
+- Sky mask generation:
+  - start from Mask2Former `sky` target masks,
+  - optionally use SAM 2 only in a narrow boundary band around semantic skyline edges,
+  - suppress semantic building, tree, vegetation, vehicle, and person masks before compositing,
+  - enforce conservative top-connected sky topology on side faces,
+  - reproject to ERP and apply seam-aware smoothing without expanding sky into foreground.
 
 ## Install
 
@@ -169,6 +175,15 @@ urpan-inpaint refine-masks \
   --sam2-roof-temporal-window 1
 ```
 
+Tune conservative sky compositing masks:
+
+```bash
+urpan-inpaint refine-masks \
+  --sky-mask-top-seed-fraction 0.12 \
+  --sky-mask-sam2-boundary-margin-px 3 \
+  --sky-mask-obstacle-dilation-px 1
+```
+
 Restrict SAM 2 to local checkpoint files and disable temporal prior prompting:
 
 ```bash
@@ -249,3 +264,5 @@ SAM 2 refined masks are written alongside the cubemap cache as:
 Each SAM 2 face `.npz` contains binary `masks`, refined `boxes_xyxy`, `scores`, `class_text`, prompt provenance, and a `used_temporal_prior` flag. The down face is always eligible for the roof prompt unless `--skip-roof-prompt` is passed.
 
 The finalized per-frame roof mask is written to `masks/roof/<frame>.png` in ERP coordinates. Its adjacent JSON sidecar records whether the mask came from current SAM 2 evidence, temporal regularization, temporal fallback, coarse-prior fallback, or a current-vs-temporal disagreement where current evidence was kept.
+
+The finalized per-frame sky mask is written to `masks/sky/<frame>.png` in ERP coordinates when usable Mask2Former sky predictions exist. Its JSON sidecar records source faces, whether SAM 2 boundary refinement contributed, and the conservative topology/smoothing policy used for alpha compositing.

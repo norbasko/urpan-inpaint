@@ -70,6 +70,10 @@ class FrameRecord:
     roof_mask_area_px: Optional[int] = None
     roof_mask_temporal_disagreement: bool = False
     roof_mask_error: str = ""
+    sky_mask_status: str = "pending"
+    sky_mask_source: str = ""
+    sky_mask_area_px: Optional[int] = None
+    sky_mask_error: str = ""
     semantic_model_id: str = ""
     semantic_output_dir: Optional[Path] = None
     semantic_has_panoptic: bool = False
@@ -142,6 +146,10 @@ class FrameRecord:
             "roof_mask_area_px": "" if self.roof_mask_area_px is None else str(self.roof_mask_area_px),
             "roof_mask_temporal_disagreement": "1" if self.roof_mask_temporal_disagreement else "0",
             "roof_mask_error": self.roof_mask_error,
+            "sky_mask_status": self.sky_mask_status,
+            "sky_mask_source": self.sky_mask_source,
+            "sky_mask_area_px": "" if self.sky_mask_area_px is None else str(self.sky_mask_area_px),
+            "sky_mask_error": self.sky_mask_error,
             "semantic_model_id": self.semantic_model_id,
             "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
             "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
@@ -197,6 +205,10 @@ class SequenceManifest:
         roof_disagreement_frames = [
             row.frame_name for row in self.rows if row.roof_mask_temporal_disagreement
         ]
+        sky_mask_frames = sum(1 for row in self.rows if row.sky_mask_status == "generated")
+        sky_empty_frames = [
+            row.frame_name for row in self.rows if row.sky_mask_status == "empty"
+        ]
         parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
         semantic_failed_frames = [
             row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
@@ -229,6 +241,8 @@ class SequenceManifest:
             "roof_mask_frames": roof_mask_frames,
             "roof_fallback_frames": roof_fallback_frames,
             "roof_disagreement_frames": roof_disagreement_frames,
+            "sky_mask_frames": sky_mask_frames,
+            "sky_empty_frames": sky_empty_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,

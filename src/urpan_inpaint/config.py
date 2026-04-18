@@ -76,6 +76,10 @@ class IndexConfig:
     sam2_roof_prior_margin_fraction: float = 0.15
     sam2_roof_temporal_window: int = 1
     sam2_roof_temporal_disagreement_iou_threshold: float = 0.4
+    sky_mask_top_seed_fraction: float = 0.12
+    sky_mask_sam2_boundary_margin_px: int = 3
+    sky_mask_obstacle_dilation_px: int = 1
+    sky_mask_erp_smoothing_iterations: int = 1
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

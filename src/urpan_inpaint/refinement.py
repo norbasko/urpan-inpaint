@@ -35,6 +35,23 @@ DYNAMIC_PROMPT_CLASSES = {
     "caravan",
 }
 
+SKY_FACE_NAMES = ("front", "right", "back", "left", "up")
+
+SKY_OPAQUE_CLASSES = {
+    "person",
+    "rider",
+    "bicycle",
+    "motorcycle",
+    "car",
+    "truck",
+    "bus",
+    "train",
+    "trailer",
+    "building",
+    "tree",
+    "vegetation",
+}
+
 
 class Sam2RuntimeError(RuntimeError):
     """Raised when SAM 2 runtime dependencies or model weights are unavailable."""
@@ -72,6 +89,14 @@ class RoofMaskResult:
     down_mask: np.ndarray
     source: str
     temporal_disagreement: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class SkyMaskResult:
+    erp_mask: np.ndarray
+    source: str
+    face_count: int
     error: str = ""
 
 
@@ -183,6 +208,69 @@ def _regularize_roof_down_mask(mask: np.ndarray, config: IndexConfig) -> np.ndar
     return np.where(regularized, 255, 0).astype(np.uint8)
 
 
+def _binary_dilate(mask: np.ndarray, radius: int, wrap_x: bool = False) -> np.ndarray:
+    result = mask > 0
+    for _ in range(max(0, int(radius))):
+        padded = np.pad(result, ((1, 1), (0, 0)), mode="edge")
+        up = padded[:-2, :]
+        down = padded[2:, :]
+        left = np.roll(result, 1, axis=1) if wrap_x else np.pad(result[:, :-1], ((0, 0), (1, 0)), mode="constant")
+        right = np.roll(result, -1, axis=1) if wrap_x else np.pad(result[:, 1:], ((0, 0), (0, 1)), mode="constant")
+        result = result | up | down | left | right
+    return result
+
+
+def _binary_erode(mask: np.ndarray, radius: int, wrap_x: bool = False) -> np.ndarray:
+    result = mask > 0
+    for _ in range(max(0, int(radius))):
+        padded = np.pad(result, ((1, 1), (0, 0)), mode="edge")
+        up = padded[:-2, :]
+        down = padded[2:, :]
+        left = np.roll(result, 1, axis=1) if wrap_x else np.pad(result[:, :-1], ((0, 0), (1, 0)), mode="constant")
+        right = np.roll(result, -1, axis=1) if wrap_x else np.pad(result[:, 1:], ((0, 0), (0, 1)), mode="constant")
+        result = result & up & down & left & right
+    return result
+
+
+def _conservative_majority_smooth(mask: np.ndarray, iterations: int, wrap_x: bool) -> np.ndarray:
+    result = mask > 0
+    for _ in range(max(0, int(iterations))):
+        vertical = np.pad(result, ((1, 1), (0, 0)), mode="edge")
+        rows = [vertical[:-2, :], result, vertical[2:, :]]
+        neighbor_count = np.zeros(result.shape, dtype=np.uint8)
+        for row in rows:
+            neighbor_count += np.roll(row, 1, axis=1).astype(np.uint8) if wrap_x else np.pad(
+                row[:, :-1], ((0, 0), (1, 0)), mode="constant"
+            ).astype(np.uint8)
+            neighbor_count += row.astype(np.uint8)
+            neighbor_count += np.roll(row, -1, axis=1).astype(np.uint8) if wrap_x else np.pad(
+                row[:, 1:], ((0, 0), (0, 1)), mode="constant"
+            ).astype(np.uint8)
+        result = result & (neighbor_count >= 2)
+    return np.where(result, 255, 0).astype(np.uint8)
+
+
+def _top_run_sky_mask(mask: np.ndarray, top_seed_fraction: float) -> np.ndarray:
+    sky = mask > 0
+    height, width = sky.shape
+    seed_rows = int(np.ceil(height * float(np.clip(top_seed_fraction, 0.01, 1.0))))
+    seed_rows = max(1, min(height, seed_rows))
+    result = np.zeros_like(sky)
+    for column in range(width):
+        top_column = sky[:seed_rows, column]
+        if not np.any(top_column):
+            continue
+        start = int(np.argmax(top_column))
+        column_sky = sky[start:, column]
+        if not np.any(column_sky):
+            continue
+        blockers = np.where(~column_sky)[0]
+        stop = len(column_sky) if len(blockers) == 0 else int(blockers[0])
+        if stop > 0:
+            result[start : start + stop, column] = True
+    return np.where(result, 255, 0).astype(np.uint8)
+
+
 def _load_grounding_prompts(frame: FrameRecord, face_name: str, width: int, height: int) -> list[Sam2Prompt]:
     face_path = grounding_output_dir_for_frame(frame) / f"{face_name}.npz"
     if not face_path.is_file():
@@ -289,6 +377,14 @@ def collect_face_prompts(
         prompts.extend(_load_semantic_prompts(frame, face_name, width, height, config))
     prompts.extend(_roof_prompt(face_name, width, height, config))
     return prompts
+
+
+def _is_roof_prompt(prompt: Sam2Prompt) -> bool:
+    return prompt.face_name == "down" and _normalize_class_text(prompt.class_text) == "roof"
+
+
+def _is_sky_prompt(prompt: Sam2Prompt) -> bool:
+    return _normalize_class_text(prompt.class_text) == "sky"
 
 
 @dataclass
@@ -841,6 +937,10 @@ def _write_sam2_metadata(output_dir: Path, refiner: Any, config: IndexConfig) ->
         "roof_prior_margin_fraction": config.sam2_roof_prior_margin_fraction,
         "roof_temporal_window": config.sam2_roof_temporal_window,
         "roof_temporal_disagreement_iou_threshold": config.sam2_roof_temporal_disagreement_iou_threshold,
+        "sky_mask_top_seed_fraction": config.sky_mask_top_seed_fraction,
+        "sky_mask_sam2_boundary_margin_px": config.sky_mask_sam2_boundary_margin_px,
+        "sky_mask_obstacle_dilation_px": config.sky_mask_obstacle_dilation_px,
+        "sky_mask_erp_smoothing_iterations": config.sky_mask_erp_smoothing_iterations,
         "temporal_propagation": config.sam2_temporal_propagation,
         "temporal_iou_threshold": config.sam2_temporal_iou_threshold,
         "temporal_area_ratio_min": config.sam2_temporal_area_ratio_min,
@@ -850,6 +950,28 @@ def _write_sam2_metadata(output_dir: Path, refiner: Any, config: IndexConfig) ->
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata_path
+
+
+def _load_semantic_target_masks(frame: FrameRecord, face_name: str) -> dict[str, np.ndarray]:
+    face_path = semantic_output_dir_for_frame(frame) / f"{face_name}.npz"
+    if not face_path.is_file():
+        return {}
+
+    with np.load(face_path) as payload:
+        if "target_masks" not in payload or "target_class_names" not in payload:
+            return {}
+        masks = payload["target_masks"]
+        names = [str(item) for item in payload["target_class_names"]]
+
+    result: dict[str, np.ndarray] = {}
+    for index, name in enumerate(names):
+        class_text = _normalize_class_text(name)
+        if index >= len(masks):
+            continue
+        mask = np.where(masks[index] > 0, 255, 0).astype(np.uint8)
+        existing = result.get(class_text)
+        result[class_text] = mask if existing is None else np.maximum(existing, mask).astype(np.uint8)
+    return result
 
 
 def _extract_roof_candidate(
@@ -1056,6 +1178,223 @@ def _finalize_roof_masks_for_sequence(
     return finalized_rows
 
 
+def _extract_sam2_sky_mask(masks: list[RefinedMask], face_name: str, shape: tuple[int, int]) -> Optional[np.ndarray]:
+    sky_masks = [
+        mask.mask
+        for mask in masks
+        if mask.face_name == face_name and _normalize_class_text(mask.class_text) == "sky"
+    ]
+    if not sky_masks:
+        return None
+
+    height, width = shape
+    combined = np.zeros((height, width), dtype=np.uint8)
+    for mask in sky_masks:
+        if mask.shape == combined.shape:
+            combined = np.maximum(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
+    return combined if int((combined > 0).sum()) > 0 else None
+
+
+def _combine_sky_semantic_and_sam2(
+    semantic_sky: np.ndarray,
+    sam2_sky: Optional[np.ndarray],
+    config: IndexConfig,
+) -> np.ndarray:
+    semantic = semantic_sky > 0
+    if sam2_sky is None:
+        return np.where(semantic, 255, 0).astype(np.uint8)
+
+    margin = max(0, int(config.sky_mask_sam2_boundary_margin_px))
+    if margin == 0:
+        refined = semantic & (sam2_sky > 0)
+        return np.where(refined, 255, 0).astype(np.uint8)
+
+    semantic_core = _binary_erode(semantic, margin)
+    semantic_support = _binary_dilate(semantic, margin)
+    sam2_boundary = (sam2_sky > 0) & semantic_support
+    refined = semantic_core | sam2_boundary
+    return np.where(refined, 255, 0).astype(np.uint8)
+
+
+def _regularize_sky_face_mask(
+    face_name: str,
+    candidate: np.ndarray,
+    blocker_mask: Optional[np.ndarray],
+    config: IndexConfig,
+) -> np.ndarray:
+    sky = candidate > 0
+    if blocker_mask is not None and int((blocker_mask > 0).sum()) > 0:
+        blocker = _binary_dilate(blocker_mask, int(config.sky_mask_obstacle_dilation_px))
+        sky &= ~blocker
+
+    if face_name in {"front", "right", "back", "left"}:
+        sky = _top_run_sky_mask(np.where(sky, 255, 0).astype(np.uint8), config.sky_mask_top_seed_fraction) > 0
+
+    sky = _conservative_majority_smooth(
+        np.where(sky, 255, 0).astype(np.uint8),
+        iterations=1 if face_name != "up" else 0,
+        wrap_x=False,
+    ) > 0
+    return np.where(sky, 255, 0).astype(np.uint8)
+
+
+def _build_sky_face_masks(
+    frame: FrameRecord,
+    masks: list[RefinedMask],
+    face_shapes: dict[str, tuple[int, int]],
+    config: IndexConfig,
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    face_masks: dict[str, np.ndarray] = {}
+    sources: list[str] = []
+    for face_name in SKY_FACE_NAMES:
+        shape = face_shapes.get(face_name)
+        if shape is None:
+            continue
+
+        semantic_targets = _load_semantic_target_masks(frame, face_name)
+        semantic_sky = semantic_targets.get("sky")
+        if semantic_sky is None or semantic_sky.shape != shape:
+            continue
+
+        blocker_mask = np.zeros(shape, dtype=np.uint8)
+        for class_text in SKY_OPAQUE_CLASSES:
+            blocker = semantic_targets.get(class_text)
+            if blocker is not None and blocker.shape == shape:
+                blocker_mask = np.maximum(blocker_mask, blocker)
+
+        sam2_sky = _extract_sam2_sky_mask(masks, face_name, shape)
+        candidate = _combine_sky_semantic_and_sam2(semantic_sky, sam2_sky, config)
+        candidate = _regularize_sky_face_mask(face_name, candidate, blocker_mask, config)
+        if int((candidate > 0).sum()) < config.sam2_min_mask_area_px:
+            continue
+
+        face_masks[face_name] = candidate
+        sources.append(f"{face_name}:{'semantic_sam2_boundary' if sam2_sky is not None else 'semantic_mask2former'}")
+    return face_masks, sources
+
+
+def _project_sky_faces_to_erp(
+    frame: FrameRecord,
+    face_masks: dict[str, np.ndarray],
+    config: IndexConfig,
+) -> np.ndarray:
+    if frame.erp_width is None or frame.erp_height is None:
+        raise RuntimeError("Cannot write sky mask without ERP dimensions")
+    if frame.cubemap_face_size is None or frame.cubemap_overlap_px is None:
+        raise RuntimeError("Cannot write sky mask without cubemap geometry")
+
+    erp_mask = np.zeros((frame.erp_height, frame.erp_width), dtype=np.uint8)
+    for face_name, face_mask in face_masks.items():
+        projected = cubemap_face_mask_to_erp(
+            face_mask,
+            face_name=face_name,
+            erp_width=frame.erp_width,
+            erp_height=frame.erp_height,
+            face_size=frame.cubemap_face_size,
+            overlap_px=frame.cubemap_overlap_px,
+        )
+        erp_mask = np.maximum(erp_mask, projected)
+
+    return _conservative_majority_smooth(
+        erp_mask,
+        iterations=int(config.sky_mask_erp_smoothing_iterations),
+        wrap_x=True,
+    )
+
+
+def _write_sky_mask_artifacts(frame: FrameRecord, result: SkyMaskResult, config: IndexConfig) -> int:
+    area_px = int((result.erp_mask > 0).sum())
+    if config.dry_run:
+        return area_px
+
+    frame.sky_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(result.erp_mask).save(frame.sky_mask_path)
+    sidecar = {
+        "frame_name": frame.frame_name,
+        "source": result.source,
+        "face_count": result.face_count,
+        "error": result.error,
+        "erp_shape": [int(value) for value in result.erp_mask.shape],
+        "area_px": area_px,
+        "topology": {
+            "side_faces": "top-run connected",
+            "up_face": "semantic conservative",
+            "smoothing": "seam-aware conservative",
+        },
+    }
+    frame.sky_mask_path.with_suffix(".json").write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return area_px
+
+
+def _finalize_sky_masks_for_sequence(
+    rows: list[FrameRecord],
+    masks_by_frame: list[list[RefinedMask]],
+    face_shapes_by_frame: list[dict[str, tuple[int, int]]],
+    config: IndexConfig,
+) -> list[FrameRecord]:
+    finalized_rows: list[FrameRecord] = []
+    for frame_index, row in enumerate(rows):
+        try:
+            face_masks, sources = _build_sky_face_masks(
+                row,
+                masks_by_frame[frame_index],
+                face_shapes_by_frame[frame_index],
+                config,
+            )
+            if not face_masks:
+                if row.erp_width is not None and row.erp_height is not None:
+                    empty_result = SkyMaskResult(
+                        erp_mask=np.zeros((row.erp_height, row.erp_width), dtype=np.uint8),
+                        source="no_sky_source",
+                        face_count=0,
+                        error="No usable Mask2Former sky prediction",
+                    )
+                    _write_sky_mask_artifacts(row, empty_result, config)
+                finalized_rows.append(
+                    replace(
+                        row,
+                        sky_mask_status="empty",
+                        sky_mask_source="no_sky_source",
+                        sky_mask_area_px=0,
+                        sky_mask_error="No usable Mask2Former sky prediction",
+                    )
+                )
+                continue
+
+            erp_mask = _project_sky_faces_to_erp(row, face_masks, config)
+            result = SkyMaskResult(
+                erp_mask=erp_mask,
+                source=";".join(sources),
+                face_count=len(face_masks),
+            )
+            area_px = _write_sky_mask_artifacts(row, result, config)
+        except Exception as exc:
+            finalized_rows.append(
+                replace(
+                    row,
+                    sky_mask_status="failed",
+                    sky_mask_source="",
+                    sky_mask_area_px=None,
+                    sky_mask_error=str(exc),
+                )
+            )
+            continue
+
+        finalized_rows.append(
+            replace(
+                row,
+                sky_mask_status="generated" if area_px > 0 else "empty",
+                sky_mask_source=result.source,
+                sky_mask_area_px=area_px,
+                sky_mask_error="",
+            )
+        )
+    return finalized_rows
+
+
 def _refine_frame_masks_with_outputs(
     frame: FrameRecord,
     config: IndexConfig,
@@ -1081,7 +1420,7 @@ def _refine_frame_masks_with_outputs(
     all_masks: list[RefinedMask] = []
     face_shapes = {face_name: face_rgbs[face_name].shape[:2] for face_name in FACE_ORDER}
     temporal_prior_count = 0
-    roof_warning = ""
+    optional_warnings: list[str] = []
     try:
         for face_name in FACE_ORDER:
             rgb = face_rgbs[face_name]
@@ -1089,23 +1428,24 @@ def _refine_frame_masks_with_outputs(
             prompts, face_prior_count = memory.attach_priors(prompts, frame_index, config, face_name=face_name)
             temporal_prior_count += face_prior_count
 
-            if face_name == "down":
-                roof_prompts = [
-                    prompt for prompt in prompts
-                    if _normalize_class_text(prompt.class_text) == "roof"
-                ]
-                other_prompts = [
-                    prompt for prompt in prompts
-                    if _normalize_class_text(prompt.class_text) != "roof"
-                ]
-                face_masks = refiner.refine_face(face_name, rgb, other_prompts) if other_prompts else []
-                if roof_prompts:
-                    try:
-                        face_masks.extend(refiner.refine_face(face_name, rgb, roof_prompts))
-                    except Exception as exc:
-                        roof_warning = f"roof SAM 2 refinement failed; roof mask will use fallback: {exc}"
-            else:
-                face_masks = refiner.refine_face(face_name, rgb, prompts) if prompts else []
+            roof_prompts = [prompt for prompt in prompts if _is_roof_prompt(prompt)]
+            sky_prompts = [prompt for prompt in prompts if _is_sky_prompt(prompt)]
+            required_prompts = [
+                prompt for prompt in prompts
+                if not _is_roof_prompt(prompt) and not _is_sky_prompt(prompt)
+            ]
+
+            face_masks = refiner.refine_face(face_name, rgb, required_prompts) if required_prompts else []
+            if sky_prompts:
+                try:
+                    face_masks.extend(refiner.refine_face(face_name, rgb, sky_prompts))
+                except Exception as exc:
+                    optional_warnings.append(f"sky SAM 2 refinement failed; sky mask will use semantic fallback: {exc}")
+            if roof_prompts:
+                try:
+                    face_masks.extend(refiner.refine_face(face_name, rgb, roof_prompts))
+                except Exception as exc:
+                    optional_warnings.append(f"roof SAM 2 refinement failed; roof mask will use fallback: {exc}")
 
             face_masks = [
                 mask for mask in face_masks if int((mask.mask > 0).sum()) >= config.sam2_min_mask_area_px
@@ -1138,7 +1478,7 @@ def _refine_frame_masks_with_outputs(
             sam2_mask_count=len(all_masks),
             sam2_temporal_prior_count=temporal_prior_count,
             sam2_refine_status="refined",
-            sam2_refine_error=roof_warning,
+            sam2_refine_error="; ".join(optional_warnings),
         ),
         masks=all_masks,
         face_shapes=face_shapes,
@@ -1169,6 +1509,12 @@ def refine_sequence_masks(sequence_manifest: SequenceManifest, config: IndexConf
     ]
     refined_rows = _finalize_roof_masks_for_sequence(
         rows=[result.frame for result in frame_results],
+        masks_by_frame=[result.masks for result in frame_results],
+        face_shapes_by_frame=[result.face_shapes for result in frame_results],
+        config=config,
+    )
+    refined_rows = _finalize_sky_masks_for_sequence(
+        rows=refined_rows,
         masks_by_frame=[result.masks for result in frame_results],
         face_shapes_by_frame=[result.face_shapes for result in frame_results],
         config=config,
@@ -1229,7 +1575,7 @@ def refine_sequence_masks_streaming(
         for face_rgbs in frame_face_rgbs
     ]
     streaming_error = ""
-    roof_streaming_warning = ""
+    optional_warnings: list[str] = []
     for face_name in FACE_ORDER:
         face_rgbs_by_frame = [
             None if face_rgbs is None else face_rgbs[face_name]
@@ -1250,25 +1596,55 @@ def refine_sequence_masks_streaming(
                 )
             )
 
-        try:
-            face_masks_by_frame, _ = refiner.refine_face_sequence(
-                face_name,
-                face_rgbs_by_frame,
-                prompts_by_frame,
-                config,
-            )
-        except Exception as exc:
-            has_non_roof_prompt = any(
-                _normalize_class_text(prompt.class_text) != "roof"
-                for prompts in prompts_by_frame
-                for prompt in prompts
-            )
-            if face_name == "down" and not has_non_roof_prompt and config.sam2_refine_roof:
-                roof_streaming_warning = f"roof SAM 2 video refinement failed; roof mask will use fallback: {exc}"
-                face_masks_by_frame = [[] for _ in face_rgbs_by_frame]
-            else:
+        prompt_groups = [
+            (
+                "required",
+                [
+                    [prompt for prompt in prompts if not _is_sky_prompt(prompt) and not _is_roof_prompt(prompt)]
+                    for prompts in prompts_by_frame
+                ],
+                False,
+            ),
+            (
+                "sky",
+                [[prompt for prompt in prompts if _is_sky_prompt(prompt)] for prompts in prompts_by_frame],
+                True,
+            ),
+            (
+                "roof",
+                [[prompt for prompt in prompts if _is_roof_prompt(prompt)] for prompts in prompts_by_frame],
+                True,
+            ),
+        ]
+
+        face_masks_by_frame: list[list[RefinedMask]] = [[] for _ in face_rgbs_by_frame]
+        for group_name, group_prompts_by_frame, optional in prompt_groups:
+            if not any(group_prompts_by_frame):
+                continue
+            try:
+                group_masks_by_frame, _ = refiner.refine_face_sequence(
+                    face_name,
+                    face_rgbs_by_frame,
+                    group_prompts_by_frame,
+                    config,
+                )
+            except Exception as exc:
+                if optional:
+                    if group_name == "sky":
+                        optional_warnings.append(
+                            f"sky SAM 2 video refinement failed; sky mask will use semantic fallback: {exc}"
+                        )
+                    else:
+                        optional_warnings.append(f"roof SAM 2 video refinement failed; roof mask will use fallback: {exc}")
+                    continue
                 streaming_error = str(exc)
                 break
+
+            for frame_index, group_masks in enumerate(group_masks_by_frame):
+                face_masks_by_frame[frame_index].extend(group_masks)
+
+        if streaming_error:
+            break
 
         for frame_index, face_masks in enumerate(face_masks_by_frame):
             masks_by_frame[frame_index].extend(face_masks)
@@ -1316,11 +1692,17 @@ def refine_sequence_masks_streaming(
                 sam2_mask_count=len(frame_masks),
                 sam2_temporal_prior_count=frame_temporal_count,
                 sam2_refine_status="refined",
-                sam2_refine_error=roof_streaming_warning,
+                sam2_refine_error="; ".join(optional_warnings),
             )
         )
 
     refined_rows = _finalize_roof_masks_for_sequence(
+        rows=refined_rows,
+        masks_by_frame=masks_by_frame,
+        face_shapes_by_frame=face_shapes_by_frame,
+        config=config,
+    )
+    refined_rows = _finalize_sky_masks_for_sequence(
         rows=refined_rows,
         masks_by_frame=masks_by_frame,
         face_shapes_by_frame=face_shapes_by_frame,
