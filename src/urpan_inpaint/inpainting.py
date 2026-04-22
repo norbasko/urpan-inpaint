@@ -77,6 +77,14 @@ class SequenceInpaintArtifacts:
     chunks: list[FaceWindowChunk]
 
 
+@dataclass(frozen=True)
+class FrameErpMasks:
+    dynamic: np.ndarray
+    roof: np.ndarray
+    sky: np.ndarray
+    inpaint: np.ndarray
+
+
 class ExternalProPainterBackend:
     def __init__(self, command_template: str, model_id: str = "ProPainter") -> None:
         if not command_template:
@@ -247,16 +255,25 @@ def sequence_lama_output_dir(manifest: SequenceManifest) -> Path:
     return manifest.output_dir / "lama_fallback"
 
 
-def _load_inpaint_mask_erp(frame: FrameRecord) -> np.ndarray:
-    if frame.erp_width is None or frame.erp_height is None:
-        raise RuntimeError("Cannot load INPAINT face masks without ERP geometry")
-    if not frame.inpaint_mask_path.is_file():
-        raise RuntimeError(f"Missing fused INPAINT mask: {frame.inpaint_mask_path}")
-    mask = np.asarray(Image.open(frame.inpaint_mask_path).convert("L"), dtype=np.uint8)
-    expected_shape = (frame.erp_height, frame.erp_width)
+def _load_required_erp_mask(path: Path, expected_shape: tuple[int, int], label: str) -> np.ndarray:
+    if not path.is_file():
+        raise RuntimeError(f"Missing final ERP {label} mask: {path}")
+    mask = np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
     if mask.shape != expected_shape:
-        raise RuntimeError(f"INPAINT mask shape {mask.shape} does not match ERP shape {expected_shape}")
+        raise RuntimeError(f"{label} mask shape {mask.shape} does not match ERP shape {expected_shape}")
     return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
+def _load_final_erp_masks(frame: FrameRecord) -> FrameErpMasks:
+    if frame.erp_width is None or frame.erp_height is None:
+        raise RuntimeError("Cannot load final ERP masks without ERP geometry")
+    expected_shape = (frame.erp_height, frame.erp_width)
+    return FrameErpMasks(
+        dynamic=_load_required_erp_mask(frame.dynamic_mask_path, expected_shape, "DYN"),
+        roof=_load_required_erp_mask(frame.roof_mask_path, expected_shape, "ROOF"),
+        sky=_load_required_erp_mask(frame.sky_mask_path, expected_shape, "SKY"),
+        inpaint=_load_required_erp_mask(frame.inpaint_mask_path, expected_shape, "INPAINT"),
+    )
 
 
 def _sample_erp_mask_to_face(mask: np.ndarray, erp_x: np.ndarray, erp_y: np.ndarray) -> np.ndarray:
@@ -273,6 +290,10 @@ def _compose_masked_prediction(original: np.ndarray, prediction: np.ndarray, mas
         )
     binary = (mask > 0)[..., None]
     return np.where(binary, prediction, original).astype(np.uint8)
+
+
+def _alpha_from_sky_mask(sky_mask: np.ndarray) -> np.ndarray:
+    return np.where(sky_mask == 255, 0, 255).astype(np.uint8)
 
 
 def _chunk_frame_indices(frame_indices: tuple[int, ...], chunk_size: int) -> list[tuple[int, ...]]:
@@ -349,13 +370,23 @@ def _write_face_artifacts(
     Image.fromarray(mask.astype(np.uint8)).save(face_dir / f"{frame.frame_stem}.mask.png")
 
 
-def _write_frame_outputs(frame: FrameRecord, rgb: np.ndarray, config: IndexConfig) -> None:
+def _write_frame_outputs(frame: FrameRecord, rgb: np.ndarray, sky_mask: np.ndarray, config: IndexConfig) -> None:
     if config.dry_run:
         return
+    if frame.erp_width is None or frame.erp_height is None:
+        raise RuntimeError("Cannot write final products without ERP geometry")
+    expected_shape = (frame.erp_height, frame.erp_width)
+    if rgb.shape != (*expected_shape, 3):
+        raise RuntimeError(f"Final RGB shape {rgb.shape} does not match ERP shape {expected_shape}")
+    if sky_mask.shape != expected_shape:
+        raise RuntimeError(f"Final SKY mask shape {sky_mask.shape} does not match ERP shape {expected_shape}")
+    if frame.rgb_output_path.suffix.lower() != ".png" or frame.rgba_output_path.suffix.lower() != ".png":
+        raise RuntimeError("Final RGB/RGBA products must be PNG files")
+
     frame.rgb_output_path.parent.mkdir(parents=True, exist_ok=True)
     frame.rgba_output_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(rgb, mode="RGB").save(frame.rgb_output_path)
-    alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+    alpha = _alpha_from_sky_mask(sky_mask)
     rgba = np.dstack([rgb, alpha]).astype(np.uint8)
     Image.fromarray(rgba, mode="RGBA").save(frame.rgba_output_path)
 
@@ -441,7 +472,7 @@ def _clone_face_rgb_mapping(
 def _select_single_frame_fallback_reason(
     config: IndexConfig,
     windows: list[InpaintWindow],
-    inpaint_masks_by_frame: dict[int, np.ndarray],
+    erp_masks_by_frame: dict[int, FrameErpMasks],
 ) -> str:
     if config.force_single_frame_fallback:
         return "force_single_frame_fallback"
@@ -452,8 +483,8 @@ def _select_single_frame_fallback_reason(
         return f"window_length_below_minimum_viable_size(max={max_window_size}, min={min_window_size})"
 
     mask_threshold = max(0, int(config.single_frame_min_mask_area_px))
-    if mask_threshold > 0 and inpaint_masks_by_frame:
-        max_mask_area = max(int((mask > 0).sum()) for mask in inpaint_masks_by_frame.values())
+    if mask_threshold > 0 and erp_masks_by_frame:
+        max_mask_area = max(int((masks.inpaint > 0).sum()) for masks in erp_masks_by_frame.values())
         if max_mask_area < mask_threshold:
             return f"mask_area_too_small(max={max_mask_area}, threshold={mask_threshold})"
 
@@ -571,7 +602,7 @@ def _run_lama_fallback_sequence(
     projected_rows: list[FrameRecord],
     face_rgbs_by_frame: dict[int, dict[str, np.ndarray]],
     face_masks_by_frame: dict[int, dict[str, np.ndarray]],
-    inpaint_masks_by_frame: dict[int, np.ndarray],
+    erp_masks_by_frame: dict[int, FrameErpMasks],
     projections_by_frame: dict[int, CubemapProjection],
     original_erp_by_frame: dict[int, np.ndarray],
     failed_rows: dict[int, FrameRecord],
@@ -629,9 +660,9 @@ def _run_lama_fallback_sequence(
             erp_rgb = _compose_masked_prediction(
                 original_erp_by_frame[frame_index],
                 reprojected_rgb,
-                inpaint_masks_by_frame[frame_index],
+                erp_masks_by_frame[frame_index].inpaint,
             )
-            _write_frame_outputs(frame, erp_rgb, config)
+            _write_frame_outputs(frame, erp_rgb, erp_masks_by_frame[frame_index].sky, config)
             rows.append(
                 replace(
                     frame,
@@ -694,7 +725,7 @@ def inpaint_sequence_faces(
     projected_rows = list(sequence_manifest.rows)
     face_rgbs_by_frame: dict[int, dict[str, np.ndarray]] = {}
     face_masks_by_frame: dict[int, dict[str, np.ndarray]] = {}
-    inpaint_masks_by_frame: dict[int, np.ndarray] = {}
+    erp_masks_by_frame: dict[int, FrameErpMasks] = {}
     projections_by_frame: dict[int, CubemapProjection] = {}
     original_erp_by_frame: dict[int, np.ndarray] = {}
     failed_rows: dict[int, FrameRecord] = {}
@@ -703,10 +734,10 @@ def inpaint_sequence_faces(
         frame = sequence_manifest.rows[frame_index]
         try:
             projected_frame, projection = load_or_create_cubemap_projection(frame, config)
-            inpaint_mask = _load_inpaint_mask_erp(projected_frame)
+            erp_masks = _load_final_erp_masks(projected_frame)
             face_masks = {
                 face_name: _sample_erp_mask_to_face(
-                    inpaint_mask,
+                    erp_masks.inpaint,
                     projection.faces[face_name].erp_x,
                     projection.faces[face_name].erp_y,
                 )
@@ -733,7 +764,7 @@ def inpaint_sequence_faces(
             for face_name in FACE_ORDER
         }
         face_masks_by_frame[frame_index] = face_masks
-        inpaint_masks_by_frame[frame_index] = inpaint_mask
+        erp_masks_by_frame[frame_index] = erp_masks
         projections_by_frame[frame_index] = projection
         original_erp_by_frame[frame_index] = original_erp
 
@@ -752,7 +783,7 @@ def inpaint_sequence_faces(
     fallback_reason = startup_fallback_reason or _select_single_frame_fallback_reason(
         config,
         processing_windows,
-        inpaint_masks_by_frame,
+        erp_masks_by_frame,
     )
     if fallback_reason:
         if fallback_backend is None:
@@ -769,7 +800,7 @@ def inpaint_sequence_faces(
             projected_rows=projected_rows,
             face_rgbs_by_frame=face_rgbs_by_frame,
             face_masks_by_frame=face_masks_by_frame,
-            inpaint_masks_by_frame=inpaint_masks_by_frame,
+            erp_masks_by_frame=erp_masks_by_frame,
             projections_by_frame=projections_by_frame,
             original_erp_by_frame=original_erp_by_frame,
             failed_rows=failed_rows,
@@ -795,7 +826,7 @@ def inpaint_sequence_faces(
             projected_rows=projected_rows,
             face_rgbs_by_frame=face_rgbs_by_frame,
             face_masks_by_frame=face_masks_by_frame,
-            inpaint_masks_by_frame=inpaint_masks_by_frame,
+            erp_masks_by_frame=erp_masks_by_frame,
             projections_by_frame=projections_by_frame,
             original_erp_by_frame=original_erp_by_frame,
             failed_rows=failed_rows,
@@ -826,7 +857,7 @@ def inpaint_sequence_faces(
                 projected_rows=projected_rows,
                 face_rgbs_by_frame=face_rgbs_by_frame,
                 face_masks_by_frame=face_masks_by_frame,
-                inpaint_masks_by_frame=inpaint_masks_by_frame,
+                erp_masks_by_frame=erp_masks_by_frame,
                 projections_by_frame=projections_by_frame,
                 original_erp_by_frame=original_erp_by_frame,
                 failed_rows=failed_rows,
@@ -879,9 +910,9 @@ def inpaint_sequence_faces(
         erp_rgb = _compose_masked_prediction(
             original_erp_by_frame[frame_index],
             reprojected_rgb,
-            inpaint_masks_by_frame[frame_index],
+            erp_masks_by_frame[frame_index].inpaint,
         )
-        _write_frame_outputs(frame, erp_rgb, config)
+        _write_frame_outputs(frame, erp_rgb, erp_masks_by_frame[frame_index].sky, config)
         inpainted_rows.append(
             replace(
                 frame,

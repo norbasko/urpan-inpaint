@@ -94,12 +94,21 @@ class InpaintingTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def write_sequence_with_inpaint_masks(self, sequence_id: str, frame_count: int) -> None:
+    def write_sequence_with_inpaint_masks(
+        self,
+        sequence_id: str,
+        frame_count: int,
+        sky_rows: int = 0,
+    ) -> None:
         sequence_dir = self.dataset_root / sequence_id
         fixed_dir = sequence_dir / "fixed"
         fixed_dir.mkdir(parents=True)
-        mask_dir = self.output_root / sequence_id / "masks" / "inpaint"
-        mask_dir.mkdir(parents=True)
+        mask_dirs = {
+            name: self.output_root / sequence_id / "masks" / name
+            for name in ("dynamic", "roof", "sky", "inpaint")
+        }
+        for mask_dir in mask_dirs.values():
+            mask_dir.mkdir(parents=True)
 
         rows = []
         for index in range(frame_count):
@@ -114,7 +123,13 @@ class InpaintingTests(unittest.TestCase):
 
             mask = np.zeros((16, 32), dtype=np.uint8)
             mask[6:11, 11:21] = 255
-            Image.fromarray(mask).save(mask_dir / f"{stem}.png")
+            sky = np.zeros((16, 32), dtype=np.uint8)
+            if sky_rows > 0:
+                sky[:sky_rows, :] = 255
+            Image.fromarray(mask).save(mask_dirs["dynamic"] / f"{stem}.png")
+            Image.fromarray(np.zeros_like(mask)).save(mask_dirs["roof"] / f"{stem}.png")
+            Image.fromarray(sky).save(mask_dirs["sky"] / f"{stem}.png")
+            Image.fromarray(mask).save(mask_dirs["inpaint"] / f"{stem}.png")
 
             rows.append(
                 [
@@ -185,10 +200,16 @@ class InpaintingTests(unittest.TestCase):
         self.assertTrue(first_frame.rgb_output_path.is_file())
         self.assertTrue(first_frame.rgba_output_path.is_file())
         source_rgb = np.asarray(Image.open(first_frame.resolved_fixed_path).convert("RGB"), dtype=np.uint8)
-        output_rgb = np.asarray(Image.open(first_frame.rgb_output_path).convert("RGB"), dtype=np.uint8)
+        output_image = Image.open(first_frame.rgb_output_path)
+        rgba_image = Image.open(first_frame.rgba_output_path)
+        self.assertEqual(output_image.format, "PNG")
+        self.assertEqual(rgba_image.format, "PNG")
+        output_rgb = np.asarray(output_image.convert("RGB"), dtype=np.uint8)
         inpaint_mask = np.asarray(Image.open(first_frame.inpaint_mask_path).convert("L"), dtype=np.uint8)
+        self.assertEqual(output_rgb.shape, source_rgb.shape)
         self.assertTrue(np.array_equal(output_rgb[inpaint_mask == 0], source_rgb[inpaint_mask == 0]))
-        rgba = np.asarray(Image.open(first_frame.rgba_output_path).convert("RGBA"), dtype=np.uint8)
+        rgba = np.asarray(rgba_image.convert("RGBA"), dtype=np.uint8)
+        self.assertEqual(rgba.shape[:2], source_rgb.shape[:2])
         self.assertTrue(np.all(rgba[..., 3] == 255))
 
         face_dir = first_frame.propainter_output_dir / "front"
@@ -201,6 +222,33 @@ class InpaintingTests(unittest.TestCase):
         self.assertEqual(metadata["face_order"], list(FACE_ORDER))
         self.assertEqual(len(metadata["windows"]), 2)
         self.assertEqual(len(metadata["chunks"]), 24)
+
+    def test_rgba_alpha_follows_final_erp_sky_mask(self) -> None:
+        sequence_id = "GS999807"
+        self.write_sequence_with_inpaint_masks(sequence_id, frame_count=2, sky_rows=4)
+        backend = FakeProPainterBackend()
+
+        manifests = run_propainter_inpainting(
+            IndexConfig(
+                dataset_root=self.dataset_root,
+                output_root=self.output_root,
+                min_valid_frames=1,
+                cube_face_size=8,
+                cube_overlap_px=2,
+                inpaint_window_size=2,
+                inpaint_window_stride=1,
+                single_frame_min_mask_area_px=1,
+            ),
+            backend=backend,
+        )
+
+        frame = manifests[0].rows[0]
+        sky = np.asarray(Image.open(frame.sky_mask_path).convert("L"), dtype=np.uint8)
+        rgba = np.asarray(Image.open(frame.rgba_output_path).convert("RGBA"), dtype=np.uint8)
+
+        self.assertEqual(rgba.shape[:2], sky.shape)
+        self.assertTrue(np.all(rgba[..., 3][sky == 255] == 0))
+        self.assertTrue(np.all(rgba[..., 3][sky == 0] == 255))
 
     def test_force_single_frame_fallback_runs_lama_per_face(self) -> None:
         sequence_id = "GS999802"
