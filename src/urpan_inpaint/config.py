@@ -93,6 +93,12 @@ class IndexConfig:
     propainter_chunk_size: int = 8
     propainter_device: str = "auto"
     propainter_face_feather_px: int = 64
+    propainter_min_window_frames: int = 2
+    single_frame_min_mask_area_px: int = 64
+    force_single_frame_fallback: bool = False
+    lama_model_id: str = "LaMa"
+    lama_command: str = ""
+    lama_device: str = "auto"
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

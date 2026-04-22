@@ -70,6 +70,11 @@ This implementation currently covers:
   - preserve unmasked face pixels after ProPainter returns predictions,
   - support chunked inference inside temporal windows for memory safety,
   - crop guard bands for per-face artifacts and feather face seams during ERP reprojection.
+- Single-frame fallback inpainting:
+  - run LaMa per cubemap face when ProPainter is unavailable, exhausts OOM retries, or is not worth invoking,
+  - trigger fallback for too-short windows, very small masks, or `--force-single-frame-fallback`,
+  - preserve the same non-sky `INPAINT` mask composition, guard-band cropping, and feathered ERP seam rules,
+  - record the fallback reason and LaMa status in the frame manifest.
 
 ## Install
 
@@ -234,6 +239,28 @@ urpan-inpaint inpaint-sequence \
   --propainter-chunk-size 8
 ```
 
+Enable LaMa fallback for short clips, small masks, ProPainter failures, or explicit single-frame operation:
+
+```bash
+urpan-inpaint inpaint-sequence \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --propainter-command "python run_propainter.py --frames {frames_dir} --masks {masks_dir} --output {output_dir} --device {device}" \
+  --lama-command "python run_lama.py --image {image_path} --mask {mask_path} --output {output_path} --device {device}" \
+  --propainter-min-window-frames 2 \
+  --single-frame-min-mask-area-px 64
+```
+
+Force single-frame fallback without trying ProPainter:
+
+```bash
+urpan-inpaint inpaint-sequence \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --force-single-frame-fallback \
+  --lama-command "python run_lama.py --image {image_path} --mask {mask_path} --output {output_path}"
+```
+
 ## Output layout
 
 For each sequence `GSxxxxxx`, the pipeline writes:
@@ -314,3 +341,5 @@ The fusion stage overwrites final ERP-space masks under `masks/dynamic`, `masks/
 Temporal inpainting windows are planned by `urpan_inpaint.windowing`. The helper keeps windows overlapping by requiring `inpaint_window_stride < inpaint_window_size`, covers all valid frames, and exposes a reconciliation plan that downstream inpainting runners can use to stitch overlapping window predictions deterministically.
 
 Sequence-level inpainting writes final ERP `rgb/<frame>.png` and `rgba/<frame>.png` outputs. ProPainter face artifacts are written under each frame's cubemap directory as `propainter/<face>/<frame>.with_overlap.png`, the cropped `propainter/<face>/<frame>.png`, and the projected face mask `propainter/<face>/<frame>.mask.png`. Sequence-level `propainter/metadata.json` records face order, windows, chunks, and seam-feather settings.
+
+LaMa fallback writes the same final ERP `rgb` and `rgba` outputs. Face artifacts are written under each frame's cubemap directory as `lama_fallback/<face>/...`, and sequence-level `lama_fallback/metadata.json` records the fallback reason, processed frame indices, face order, and seam-feather settings. The frame manifest records `single_frame_fallback_reason`, `lama_status`, `lama_model_id`, and `lama_output_dir`.

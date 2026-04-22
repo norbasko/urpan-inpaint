@@ -709,6 +709,41 @@ def build_parser() -> argparse.ArgumentParser:
         default=64,
         help="Feather width used when reprojecting independently inpainted faces back to ERP.",
     )
+    inpaint_parser.add_argument(
+        "--propainter-min-window-frames",
+        type=int,
+        default=2,
+        help="Use LaMa fallback when the longest available ProPainter window is shorter than this.",
+    )
+    inpaint_parser.add_argument(
+        "--single-frame-min-mask-area-px",
+        type=int,
+        default=64,
+        help="Use LaMa fallback when every frame's ERP INPAINT mask is smaller than this area.",
+    )
+    inpaint_parser.add_argument(
+        "--force-single-frame-fallback",
+        action="store_true",
+        help="Bypass ProPainter and run LaMa per face.",
+    )
+    inpaint_parser.add_argument(
+        "--lama-model-id",
+        default="LaMa",
+        help="LaMa implementation identifier recorded in manifests.",
+    )
+    inpaint_parser.add_argument(
+        "--lama-command",
+        default="",
+        help=(
+            "External LaMa command template. It may use {image_path}, {mask_path}, "
+            "{output_path}, {output_dir}, {face_name}, and {device}; it must write {output_path}."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--lama-device",
+        default="auto",
+        help="Device token passed into the LaMa command template.",
+    )
     return parser
 
 
@@ -1106,15 +1141,48 @@ def handle_inpaint_sequence(args: argparse.Namespace) -> int:
         propainter_device=args.propainter_device,
         propainter_chunk_size=args.propainter_chunk_size,
         propainter_face_feather_px=args.propainter_face_feather_px,
+        propainter_min_window_frames=args.propainter_min_window_frames,
+        single_frame_min_mask_area_px=args.single_frame_min_mask_area_px,
+        force_single_frame_fallback=args.force_single_frame_fallback,
+        lama_model_id=args.lama_model_id,
+        lama_command=args.lama_command,
+        lama_device=args.lama_device,
     )
-    if not config.dry_run and not config.propainter_command:
+    if not config.dry_run and config.force_single_frame_fallback and not config.lama_command:
         print(
             json.dumps(
                 {
-                    "error": "inpaint-sequence requires --propainter-command unless --dry-run is used",
+                    "error": "inpaint-sequence requires --lama-command when --force-single-frame-fallback is used",
+                    "lama_command_placeholders": [
+                        "{image_path}",
+                        "{mask_path}",
+                        "{output_path}",
+                        "{output_dir}",
+                        "{face_name}",
+                        "{device}",
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+    if not config.dry_run and not config.propainter_command and not config.lama_command:
+        print(
+            json.dumps(
+                {
+                    "error": "inpaint-sequence requires --propainter-command or --lama-command unless --dry-run is used",
                     "propainter_command_placeholders": [
                         "{frames_dir}",
                         "{masks_dir}",
+                        "{output_dir}",
+                        "{face_name}",
+                        "{device}",
+                    ],
+                    "lama_command_placeholders": [
+                        "{image_path}",
+                        "{mask_path}",
+                        "{output_path}",
                         "{output_dir}",
                         "{face_name}",
                         "{device}",
@@ -1141,11 +1209,24 @@ def handle_inpaint_sequence(args: argparse.Namespace) -> int:
         "propainter_device": config.propainter_device,
         "propainter_chunk_size": config.propainter_chunk_size,
         "propainter_face_feather_px": config.propainter_face_feather_px,
+        "propainter_min_window_frames": config.propainter_min_window_frames,
+        "single_frame_min_mask_area_px": config.single_frame_min_mask_area_px,
+        "force_single_frame_fallback": config.force_single_frame_fallback,
+        "lama_model_id": config.lama_model_id,
+        "lama_device": config.lama_device,
         "sequence_count": len(manifests),
         "inpainted_sequences": sum(1 for item in manifests if item.status == "ready"),
         "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
         "inpainted_frames": sum(
-            sum(1 for row in item.rows if row.propainter_status == "inpainted")
+            sum(1 for row in item.rows if row.propainter_status in {"inpainted", "fallback_lama"})
+            for item in manifests
+        ),
+        "single_frame_fallback_frames": sum(
+            sum(1 for row in item.rows if row.single_frame_fallback_reason)
+            for item in manifests
+        ),
+        "lama_frames": sum(
+            sum(1 for row in item.rows if row.lama_status == "inpainted")
             for item in manifests
         ),
         "failed_frames": sum(

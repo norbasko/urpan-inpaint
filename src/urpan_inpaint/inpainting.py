@@ -29,6 +29,14 @@ class ProPainterRuntimeError(RuntimeError):
     """Raised when ProPainter inference cannot be executed in the selected environment."""
 
 
+class ProPainterOutOfMemoryError(ProPainterRuntimeError):
+    """Raised after ProPainter exhausts all chunk-size retry levels due to OOM."""
+
+
+class LaMaRuntimeError(RuntimeError):
+    """Raised when LaMa fallback inference cannot be executed in the selected environment."""
+
+
 class ProPainterBackend(Protocol):
     model_id: str
 
@@ -40,6 +48,19 @@ class ProPainterBackend(Protocol):
         config: IndexConfig,
     ) -> list[np.ndarray]:
         """Return inpainted RGB frames for one temporally ordered face clip."""
+
+
+class LaMaBackend(Protocol):
+    model_id: str
+
+    def inpaint_image(
+        self,
+        face_name: str,
+        image: np.ndarray,
+        mask: np.ndarray,
+        config: IndexConfig,
+    ) -> np.ndarray:
+        """Return one LaMa-inpainted RGB face image."""
 
 
 @dataclass(frozen=True)
@@ -139,12 +160,91 @@ class PassthroughProPainterBackend:
         return [frame.copy() for frame in frames]
 
 
+class ExternalLaMaBackend:
+    def __init__(self, command_template: str, model_id: str = "LaMa") -> None:
+        if not command_template:
+            raise LaMaRuntimeError(
+                "LaMa fallback requires --lama-command or an injected LaMaBackend. "
+                "The command template may use {image_path}, {mask_path}, {output_path}, "
+                "{output_dir}, {face_name}, and {device}."
+            )
+        self.command_template = command_template
+        self.model_id = model_id
+
+    @classmethod
+    def from_config(cls, config: IndexConfig) -> "ExternalLaMaBackend":
+        return cls(command_template=config.lama_command, model_id=config.lama_model_id)
+
+    def inpaint_image(
+        self,
+        face_name: str,
+        image: np.ndarray,
+        mask: np.ndarray,
+        config: IndexConfig,
+    ) -> np.ndarray:
+        with tempfile.TemporaryDirectory(prefix="urpan-lama-") as temp_name:
+            temp_dir = Path(temp_name)
+            image_path = temp_dir / "image.png"
+            mask_path = temp_dir / "mask.png"
+            output_dir = temp_dir / "output"
+            output_path = output_dir / "output.png"
+            output_dir.mkdir()
+            Image.fromarray(image.astype(np.uint8), mode="RGB").save(image_path)
+            Image.fromarray(np.where(mask > 0, 255, 0).astype(np.uint8)).save(mask_path)
+
+            command = self.command_template.format(
+                image_path=str(image_path),
+                mask_path=str(mask_path),
+                output_path=str(output_path),
+                output_dir=str(output_dir),
+                face_name=face_name,
+                device=config.lama_device,
+            )
+            completed = subprocess.run(
+                shlex.split(command),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                raise LaMaRuntimeError(
+                    f"LaMa command failed with exit code {completed.returncode}: {completed.stderr.strip()}"
+                )
+            if not output_path.is_file():
+                raise LaMaRuntimeError(f"LaMa command did not write {output_path}")
+            output = np.asarray(Image.open(output_path).convert("RGB"), dtype=np.uint8)
+            if output.shape != image.shape:
+                raise LaMaRuntimeError(f"LaMa output shape {output.shape} does not match input shape {image.shape}")
+            return output
+
+
+class PassthroughLaMaBackend:
+    model_id = "LaMa/dry-run-passthrough"
+
+    def inpaint_image(
+        self,
+        face_name: str,
+        image: np.ndarray,
+        mask: np.ndarray,
+        config: IndexConfig,
+    ) -> np.ndarray:
+        return image.copy()
+
+
 def propainter_output_dir_for_frame(frame: FrameRecord) -> Path:
     return frame.cubemap_cache_dir / "propainter"
 
 
 def sequence_propainter_output_dir(manifest: SequenceManifest) -> Path:
     return manifest.output_dir / "propainter"
+
+
+def lama_output_dir_for_frame(frame: FrameRecord) -> Path:
+    return frame.cubemap_cache_dir / "lama_fallback"
+
+
+def sequence_lama_output_dir(manifest: SequenceManifest) -> Path:
+    return manifest.output_dir / "lama_fallback"
 
 
 def _load_inpaint_mask_erp(frame: FrameRecord) -> np.ndarray:
@@ -289,6 +389,77 @@ def _write_sequence_metadata(
     (output_dir / "metadata.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _write_lama_sequence_metadata(
+    output_dir: Path,
+    fallback_reason: str,
+    backend: LaMaBackend,
+    config: IndexConfig,
+    windows: list[InpaintWindow],
+    processed_frame_indices: list[int],
+) -> None:
+    if config.dry_run:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_id": getattr(backend, "model_id", config.lama_model_id),
+        "fallback_reason": fallback_reason,
+        "face_order": list(FACE_ORDER),
+        "window_size": config.inpaint_window_size,
+        "window_stride": config.inpaint_window_stride,
+        "propainter_min_window_frames": config.propainter_min_window_frames,
+        "single_frame_min_mask_area_px": config.single_frame_min_mask_area_px,
+        "face_feather_px": config.propainter_face_feather_px,
+        "windows": [window.to_dict() for window in windows],
+        "processed_frame_indices": processed_frame_indices,
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "oom" in text or "cuda memory" in text
+
+
+def _propainter_retry_chunk_sizes(initial_chunk_size: int) -> list[int]:
+    size = max(1, int(initial_chunk_size))
+    sizes: list[int] = []
+    while size >= 1:
+        if size not in sizes:
+            sizes.append(size)
+        if size == 1:
+            break
+        size = max(1, size // 2)
+    return sizes
+
+
+def _clone_face_rgb_mapping(
+    face_rgbs_by_frame: dict[int, dict[str, np.ndarray]],
+) -> dict[int, dict[str, np.ndarray]]:
+    return {frame_index: dict(face_rgbs) for frame_index, face_rgbs in face_rgbs_by_frame.items()}
+
+
+def _select_single_frame_fallback_reason(
+    config: IndexConfig,
+    windows: list[InpaintWindow],
+    inpaint_masks_by_frame: dict[int, np.ndarray],
+) -> str:
+    if config.force_single_frame_fallback:
+        return "force_single_frame_fallback"
+
+    max_window_size = max((window.size for window in windows), default=0)
+    min_window_size = max(1, int(config.propainter_min_window_frames))
+    if max_window_size < min_window_size:
+        return f"window_length_below_minimum_viable_size(max={max_window_size}, min={min_window_size})"
+
+    mask_threshold = max(0, int(config.single_frame_min_mask_area_px))
+    if mask_threshold > 0 and inpaint_masks_by_frame:
+        max_mask_area = max(int((mask > 0).sum()) for mask in inpaint_masks_by_frame.values())
+        if max_mask_area < mask_threshold:
+            return f"mask_area_too_small(max={max_mask_area}, threshold={mask_threshold})"
+
+    return ""
+
+
 def _process_face_stream(
     face_name: str,
     windows: list[InpaintWindow],
@@ -331,10 +502,183 @@ def _process_face_stream(
     return dict(zip(ordered_frame_indices, reconciled)), chunks
 
 
+def _run_propainter_face_streams_with_retries(
+    windows: list[InpaintWindow],
+    face_rgbs_by_frame: dict[int, dict[str, np.ndarray]],
+    face_masks_by_frame: dict[int, dict[str, np.ndarray]],
+    backend: ProPainterBackend,
+    config: IndexConfig,
+) -> tuple[dict[int, dict[str, np.ndarray]], list[FaceWindowChunk]]:
+    last_oom: Optional[BaseException] = None
+    for chunk_size in _propainter_retry_chunk_sizes(config.propainter_chunk_size):
+        attempt_config = replace(config, propainter_chunk_size=chunk_size)
+        attempt_face_rgbs = _clone_face_rgb_mapping(face_rgbs_by_frame)
+        all_chunks: list[FaceWindowChunk] = []
+        try:
+            for face_name in FACE_ORDER:
+                face_outputs, chunks = _process_face_stream(
+                    face_name=face_name,
+                    windows=windows,
+                    face_rgbs_by_frame=attempt_face_rgbs,
+                    face_masks_by_frame=face_masks_by_frame,
+                    backend=backend,
+                    config=attempt_config,
+                )
+                all_chunks.extend(chunks)
+                for frame_index, rgb in face_outputs.items():
+                    attempt_face_rgbs[frame_index][face_name] = rgb
+            return attempt_face_rgbs, all_chunks
+        except Exception as exc:
+            if not _is_oom_error(exc):
+                raise
+            last_oom = exc
+
+    raise ProPainterOutOfMemoryError(f"out-of-memory during all retry levels: {last_oom}")
+
+
+def _mark_single_frame_fallback_unavailable(
+    sequence_manifest: SequenceManifest,
+    projected_rows: list[FrameRecord],
+    processing_windows: list[InpaintWindow],
+    failed_rows: dict[int, FrameRecord],
+    config: IndexConfig,
+    fallback_reason: str,
+    propainter_error: str = "",
+) -> SequenceManifest:
+    error = f"LaMa fallback unavailable: {fallback_reason}"
+    if propainter_error:
+        error = f"{error}; ProPainter error: {propainter_error}"
+    rows: list[FrameRecord] = []
+    for frame_index, row in enumerate(projected_rows):
+        if frame_index in failed_rows:
+            rows.append(failed_rows[frame_index])
+            continue
+        rows.append(
+            replace(
+                row,
+                propainter_window_count=len(processing_windows),
+                propainter_chunk_count=0,
+                propainter_status="failed" if row.file_exists else row.propainter_status,
+                propainter_error=error if row.file_exists else row.propainter_error,
+                single_frame_fallback_reason=fallback_reason if row.file_exists else row.single_frame_fallback_reason,
+            )
+        )
+    return _finish_inpaint_manifest(sequence_manifest, rows, config)
+
+
+def _run_lama_fallback_sequence(
+    sequence_manifest: SequenceManifest,
+    projected_rows: list[FrameRecord],
+    face_rgbs_by_frame: dict[int, dict[str, np.ndarray]],
+    face_masks_by_frame: dict[int, dict[str, np.ndarray]],
+    inpaint_masks_by_frame: dict[int, np.ndarray],
+    projections_by_frame: dict[int, CubemapProjection],
+    original_erp_by_frame: dict[int, np.ndarray],
+    failed_rows: dict[int, FrameRecord],
+    processing_windows: list[InpaintWindow],
+    backend: LaMaBackend,
+    config: IndexConfig,
+    fallback_reason: str,
+    propainter_error: str = "",
+) -> SequenceManifest:
+    processed_frame_indices = sorted(face_rgbs_by_frame)
+    rows: list[FrameRecord] = []
+    for frame_index, frame in enumerate(projected_rows):
+        if frame_index in failed_rows:
+            rows.append(
+                replace(
+                    failed_rows[frame_index],
+                    single_frame_fallback_reason=fallback_reason,
+                    lama_model_id=getattr(backend, "model_id", config.lama_model_id),
+                    lama_output_dir=sequence_lama_output_dir(sequence_manifest),
+                    lama_status="failed",
+                    lama_error=failed_rows[frame_index].propainter_error,
+                )
+            )
+            continue
+        if frame_index not in face_rgbs_by_frame:
+            rows.append(frame)
+            continue
+
+        try:
+            frame_faces = dict(face_rgbs_by_frame[frame_index])
+            for face_name in FACE_ORDER:
+                original = frame_faces[face_name]
+                mask = face_masks_by_frame[frame_index][face_name]
+                prediction = backend.inpaint_image(face_name, original, mask, config)
+                frame_faces[face_name] = _compose_masked_prediction(original, prediction, mask)
+
+            projection = projections_by_frame[frame_index]
+            for face_name in FACE_ORDER:
+                _write_face_artifacts(
+                    output_dir=lama_output_dir_for_frame(frame),
+                    face_name=face_name,
+                    frame=frame,
+                    rgb=frame_faces[face_name],
+                    mask=face_masks_by_frame[frame_index][face_name],
+                    overlap_px=projection.overlap_px,
+                    config=config,
+                )
+
+            reprojected_rgb = _reproject_inpainted_faces_to_erp(
+                projection=projection,
+                face_rgbs=frame_faces,
+                original_erp_rgb=original_erp_by_frame[frame_index],
+                config=config,
+            )
+            erp_rgb = _compose_masked_prediction(
+                original_erp_by_frame[frame_index],
+                reprojected_rgb,
+                inpaint_masks_by_frame[frame_index],
+            )
+            _write_frame_outputs(frame, erp_rgb, config)
+            rows.append(
+                replace(
+                    frame,
+                    propainter_window_count=len(processing_windows),
+                    propainter_chunk_count=0,
+                    propainter_status="fallback_lama",
+                    propainter_error=propainter_error,
+                    lama_model_id=getattr(backend, "model_id", config.lama_model_id),
+                    lama_output_dir=lama_output_dir_for_frame(frame),
+                    lama_status="inpainted",
+                    lama_error="",
+                    single_frame_fallback_reason=fallback_reason,
+                )
+            )
+        except Exception as exc:
+            rows.append(
+                replace(
+                    frame,
+                    propainter_window_count=len(processing_windows),
+                    propainter_chunk_count=0,
+                    propainter_status="failed",
+                    propainter_error=propainter_error or fallback_reason,
+                    lama_model_id=getattr(backend, "model_id", config.lama_model_id),
+                    lama_output_dir=lama_output_dir_for_frame(frame),
+                    lama_status="failed",
+                    lama_error=str(exc),
+                    single_frame_fallback_reason=fallback_reason,
+                )
+            )
+
+    _write_lama_sequence_metadata(
+        sequence_lama_output_dir(sequence_manifest),
+        fallback_reason=fallback_reason,
+        backend=backend,
+        config=config,
+        windows=processing_windows,
+        processed_frame_indices=processed_frame_indices,
+    )
+    return _finish_inpaint_manifest(sequence_manifest, rows, config)
+
+
 def inpaint_sequence_faces(
     sequence_manifest: SequenceManifest,
     config: IndexConfig,
-    backend: ProPainterBackend,
+    backend: Optional[ProPainterBackend],
+    fallback_backend: Optional[LaMaBackend] = None,
+    startup_fallback_reason: str = "",
 ) -> SequenceManifest:
     if sequence_manifest.status != "ready":
         return sequence_manifest
@@ -405,29 +749,100 @@ def inpaint_sequence_faces(
         for frame_index, row in failed_rows.items()
     }
 
-    all_chunks: list[FaceWindowChunk] = []
-    try:
-        for face_name in FACE_ORDER:
-            face_outputs, chunks = _process_face_stream(
-                face_name=face_name,
-                windows=processing_windows,
-                face_rgbs_by_frame=face_rgbs_by_frame,
-                face_masks_by_frame=face_masks_by_frame,
-                backend=backend,
+    fallback_reason = startup_fallback_reason or _select_single_frame_fallback_reason(
+        config,
+        processing_windows,
+        inpaint_masks_by_frame,
+    )
+    if fallback_reason:
+        if fallback_backend is None:
+            return _mark_single_frame_fallback_unavailable(
+                sequence_manifest=sequence_manifest,
+                projected_rows=projected_rows,
+                processing_windows=processing_windows,
+                failed_rows=failed_rows,
                 config=config,
+                fallback_reason=fallback_reason,
             )
-            all_chunks.extend(chunks)
-            for frame_index, rgb in face_outputs.items():
-                face_rgbs_by_frame[frame_index][face_name] = rgb
+        return _run_lama_fallback_sequence(
+            sequence_manifest=sequence_manifest,
+            projected_rows=projected_rows,
+            face_rgbs_by_frame=face_rgbs_by_frame,
+            face_masks_by_frame=face_masks_by_frame,
+            inpaint_masks_by_frame=inpaint_masks_by_frame,
+            projections_by_frame=projections_by_frame,
+            original_erp_by_frame=original_erp_by_frame,
+            failed_rows=failed_rows,
+            processing_windows=processing_windows,
+            backend=fallback_backend,
+            config=config,
+            fallback_reason=fallback_reason,
+        )
+
+    if backend is None:
+        fallback_reason = "propainter_model_load_failure"
+        if fallback_backend is None:
+            return _mark_single_frame_fallback_unavailable(
+                sequence_manifest=sequence_manifest,
+                projected_rows=projected_rows,
+                processing_windows=processing_windows,
+                failed_rows=failed_rows,
+                config=config,
+                fallback_reason=fallback_reason,
+            )
+        return _run_lama_fallback_sequence(
+            sequence_manifest=sequence_manifest,
+            projected_rows=projected_rows,
+            face_rgbs_by_frame=face_rgbs_by_frame,
+            face_masks_by_frame=face_masks_by_frame,
+            inpaint_masks_by_frame=inpaint_masks_by_frame,
+            projections_by_frame=projections_by_frame,
+            original_erp_by_frame=original_erp_by_frame,
+            failed_rows=failed_rows,
+            processing_windows=processing_windows,
+            backend=fallback_backend,
+            config=config,
+            fallback_reason=fallback_reason,
+        )
+
+    try:
+        face_rgbs_by_frame, all_chunks = _run_propainter_face_streams_with_retries(
+            windows=processing_windows,
+            face_rgbs_by_frame=face_rgbs_by_frame,
+            face_masks_by_frame=face_masks_by_frame,
+            backend=backend,
+            config=config,
+        )
     except Exception as exc:
         failed_error = str(exc)
+        if fallback_backend is not None:
+            fallback_reason = (
+                "propainter_oom_all_retry_levels"
+                if isinstance(exc, ProPainterOutOfMemoryError)
+                else f"propainter_inference_failed: {failed_error}"
+            )
+            return _run_lama_fallback_sequence(
+                sequence_manifest=sequence_manifest,
+                projected_rows=projected_rows,
+                face_rgbs_by_frame=face_rgbs_by_frame,
+                face_masks_by_frame=face_masks_by_frame,
+                inpaint_masks_by_frame=inpaint_masks_by_frame,
+                projections_by_frame=projections_by_frame,
+                original_erp_by_frame=original_erp_by_frame,
+                failed_rows=failed_rows,
+                processing_windows=processing_windows,
+                backend=fallback_backend,
+                config=config,
+                fallback_reason=fallback_reason,
+                propainter_error=failed_error,
+            )
         inpainted_rows = [
             replace(
                 row,
                 propainter_model_id=getattr(backend, "model_id", config.propainter_model_id),
                 propainter_output_dir=output_dir,
                 propainter_window_count=len(processing_windows),
-                propainter_chunk_count=len(all_chunks),
+                propainter_chunk_count=0,
                 propainter_status="failed" if row.file_exists else row.propainter_status,
                 propainter_error=failed_error if row.file_exists else row.propainter_error,
             )
@@ -517,12 +932,42 @@ def run_propainter_inpainting(
     config: IndexConfig,
     sequence_ids: Optional[Iterable[str]] = None,
     backend: Any = None,
+    fallback_backend: Any = None,
 ) -> list[SequenceManifest]:
-    if backend is not None:
-        propainter_backend = backend
-    elif config.dry_run and not config.propainter_command:
-        propainter_backend = PassthroughProPainterBackend()
+    if fallback_backend is not None:
+        lama_backend = fallback_backend
+    elif config.lama_command:
+        lama_backend = ExternalLaMaBackend.from_config(config)
+    elif config.dry_run:
+        lama_backend = PassthroughLaMaBackend()
     else:
-        propainter_backend = ExternalProPainterBackend.from_config(config)
+        lama_backend = None
+
+    startup_fallback_reason = ""
+    if config.force_single_frame_fallback:
+        propainter_backend: Optional[ProPainterBackend] = None
+    else:
+        try:
+            if backend is not None:
+                propainter_backend = backend
+            elif config.dry_run and not config.propainter_command:
+                propainter_backend = PassthroughProPainterBackend()
+            else:
+                propainter_backend = ExternalProPainterBackend.from_config(config)
+        except Exception as exc:
+            if lama_backend is None:
+                raise
+            propainter_backend = None
+            startup_fallback_reason = f"propainter_model_load_failure: {exc}"
+
     indexed_manifests = run_indexing(config, sequence_ids=sequence_ids)
-    return [inpaint_sequence_faces(manifest, config, propainter_backend) for manifest in indexed_manifests]
+    return [
+        inpaint_sequence_faces(
+            manifest,
+            config,
+            propainter_backend,
+            fallback_backend=lama_backend,
+            startup_fallback_reason=startup_fallback_reason,
+        )
+        for manifest in indexed_manifests
+    ]

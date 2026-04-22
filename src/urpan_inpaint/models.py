@@ -89,6 +89,11 @@ class FrameRecord:
     propainter_chunk_count: Optional[int] = None
     propainter_status: str = "pending"
     propainter_error: str = ""
+    lama_model_id: str = ""
+    lama_output_dir: Optional[Path] = None
+    lama_status: str = "pending"
+    lama_error: str = ""
+    single_frame_fallback_reason: str = ""
     semantic_model_id: str = ""
     semantic_output_dir: Optional[Path] = None
     semantic_has_panoptic: bool = False
@@ -180,6 +185,11 @@ class FrameRecord:
             "propainter_chunk_count": "" if self.propainter_chunk_count is None else str(self.propainter_chunk_count),
             "propainter_status": self.propainter_status,
             "propainter_error": self.propainter_error,
+            "lama_model_id": self.lama_model_id,
+            "lama_output_dir": "" if self.lama_output_dir is None else str(self.lama_output_dir),
+            "lama_status": self.lama_status,
+            "lama_error": self.lama_error,
+            "single_frame_fallback_reason": self.single_frame_fallback_reason,
             "semantic_model_id": self.semantic_model_id,
             "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
             "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
@@ -248,6 +258,13 @@ class SequenceManifest:
         propainter_failed_frames = [
             row.frame_name for row in self.rows if row.propainter_status == "failed"
         ]
+        lama_frames = sum(1 for row in self.rows if row.lama_status == "inpainted")
+        lama_failed_frames = [
+            row.frame_name for row in self.rows if row.lama_status == "failed"
+        ]
+        single_frame_fallback_frames = [
+            row.frame_name for row in self.rows if row.single_frame_fallback_reason
+        ]
         parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
         semantic_failed_frames = [
             row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
@@ -287,6 +304,9 @@ class SequenceManifest:
             "fusion_failed_frames": fusion_failed_frames,
             "propainter_frames": propainter_frames,
             "propainter_failed_frames": propainter_failed_frames,
+            "lama_frames": lama_frames,
+            "lama_failed_frames": lama_failed_frames,
+            "single_frame_fallback_frames": single_frame_fallback_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,
