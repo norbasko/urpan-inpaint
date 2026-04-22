@@ -75,6 +75,13 @@ This implementation currently covers:
   - trigger fallback for too-short windows, very small masks, or `--force-single-frame-fallback`,
   - preserve the same non-sky `INPAINT` mask composition, guard-band cropping, and feathered ERP seam rules,
   - record the fallback reason and LaMa status in the frame manifest.
+- QA metrics and diagnostics:
+  - measure per-frame sky, dynamic, roof, and inpaint mask ratios,
+  - count dynamic and roof mask connected components,
+  - measure left-right RGB and alpha seam deltas,
+  - infer ProPainter versus LaMa fallback usage from manifests and face artifacts,
+  - write per-sequence medians, seam percentiles, fallback counts, and stage failure counts,
+  - render sampled diagnostic panels with original RGB, masks, final RGB, and RGBA checkerboard preview.
 
 ## Install
 
@@ -261,6 +268,16 @@ urpan-inpaint inpaint-sequence \
   --lama-command "python run_lama.py --image {image_path} --mask {mask_path} --output {output_path}"
 ```
 
+Compute QA metrics and sampled diagnostic panels after inpainting:
+
+```bash
+urpan-inpaint qa \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --qa-sample-count 8 \
+  --qa-diagnostic-panel-width-px 320
+```
+
 ## Output layout
 
 For each sequence `GSxxxxxx`, the pipeline writes:
@@ -277,6 +294,9 @@ For each sequence `GSxxxxxx`, the pipeline writes:
     union_debug/
   cubemap/
   qa/
+    metrics/
+      frame_metrics.csv
+      sequence_metrics.json
     overlays/
     contact_sheets/
   manifests/
@@ -343,3 +363,5 @@ Temporal inpainting windows are planned by `urpan_inpaint.windowing`. The helper
 Sequence-level inpainting writes final ERP `rgb/<frame>.png` and `rgba/<frame>.png` outputs. Final products are PNG only and must match the input ERP resolution exactly. RGBA alpha is derived from the final ERP sky mask: `alpha=0` where `SKY == 255`, and `alpha=255` elsewhere. ProPainter face artifacts are written under each frame's cubemap directory as `propainter/<face>/<frame>.with_overlap.png`, the cropped `propainter/<face>/<frame>.png`, and the projected face mask `propainter/<face>/<frame>.mask.png`. Sequence-level `propainter/metadata.json` records face order, windows, chunks, and seam-feather settings.
 
 LaMa fallback writes the same final ERP `rgb` and `rgba` outputs. Face artifacts are written under each frame's cubemap directory as `lama_fallback/<face>/...`, and sequence-level `lama_fallback/metadata.json` records the fallback reason, processed frame indices, face order, and seam-feather settings. The frame manifest records `single_frame_fallback_reason`, `lama_status`, `lama_model_id`, and `lama_output_dir`.
+
+QA writes `qa/metrics/frame_metrics.csv` with the required per-frame ratios, component counts, seam deltas, fallback flags, and measurement time. It writes `qa/metrics/sequence_metrics.json` with processed/skipped/fallback frame counts, median mask ratios, seam-error percentiles, and failure counts by stage. Sampled diagnostic panels are written to `qa/overlays/<frame>.overlay.png`.

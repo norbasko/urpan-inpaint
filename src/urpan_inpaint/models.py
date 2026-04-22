@@ -17,6 +17,10 @@ REQUIRED_CSV_FIELDS = (
 )
 
 
+def _manifest_float(value: Optional[float]) -> str:
+    return "" if value is None else f"{value:.8f}"
+
+
 @dataclass(frozen=True)
 class FrameRecord:
     sequence_id: str
@@ -112,6 +116,19 @@ class FrameRecord:
     sam2_temporal_prior_count: Optional[int] = None
     sam2_refine_status: str = "pending"
     sam2_refine_error: str = ""
+    qa_sky_ratio: Optional[float] = None
+    qa_dynamic_ratio: Optional[float] = None
+    qa_roof_ratio: Optional[float] = None
+    qa_inpaint_ratio: Optional[float] = None
+    qa_mask_components_dynamic: Optional[int] = None
+    qa_mask_components_roof: Optional[int] = None
+    qa_seam_delta_rgb: Optional[float] = None
+    qa_seam_delta_alpha: Optional[float] = None
+    qa_used_propainter: bool = False
+    qa_used_lama_fallback: bool = False
+    qa_processing_time_sec: Optional[float] = None
+    qa_status: str = "pending"
+    qa_error: str = ""
 
     def to_manifest_row(self) -> dict[str, str]:
         return {
@@ -210,6 +227,23 @@ class FrameRecord:
             ),
             "sam2_refine_status": self.sam2_refine_status,
             "sam2_refine_error": self.sam2_refine_error,
+            "qa_sky_ratio": _manifest_float(self.qa_sky_ratio),
+            "qa_dynamic_ratio": _manifest_float(self.qa_dynamic_ratio),
+            "qa_roof_ratio": _manifest_float(self.qa_roof_ratio),
+            "qa_inpaint_ratio": _manifest_float(self.qa_inpaint_ratio),
+            "qa_mask_components_dynamic": (
+                "" if self.qa_mask_components_dynamic is None else str(self.qa_mask_components_dynamic)
+            ),
+            "qa_mask_components_roof": (
+                "" if self.qa_mask_components_roof is None else str(self.qa_mask_components_roof)
+            ),
+            "qa_seam_delta_rgb": _manifest_float(self.qa_seam_delta_rgb),
+            "qa_seam_delta_alpha": _manifest_float(self.qa_seam_delta_alpha),
+            "qa_used_propainter": "1" if self.qa_used_propainter else "0",
+            "qa_used_lama_fallback": "1" if self.qa_used_lama_fallback else "0",
+            "qa_processing_time_sec": _manifest_float(self.qa_processing_time_sec),
+            "qa_status": self.qa_status,
+            "qa_error": self.qa_error,
         }
 
 
@@ -277,6 +311,13 @@ class SequenceManifest:
         sam2_failed_frames = [
             row.frame_name for row in self.rows if row.sam2_refine_status == "failed"
         ]
+        qa_measured_frames = sum(1 for row in self.rows if row.qa_status == "measured")
+        qa_failed_frames = [
+            row.frame_name for row in self.rows if row.qa_status == "failed"
+        ]
+        qa_overlay_frames = [
+            row.frame_name for row in self.rows if row.overlay_output_path.is_file()
+        ]
         return {
             "sequence_id": self.sequence_id,
             "sequence_dir": str(self.sequence_dir),
@@ -313,5 +354,8 @@ class SequenceManifest:
             "grounding_failed_frames": grounding_failed_frames,
             "refined_frames": refined_frames,
             "sam2_failed_frames": sam2_failed_frames,
+            "qa_measured_frames": qa_measured_frames,
+            "qa_failed_frames": qa_failed_frames,
+            "qa_overlay_frames": qa_overlay_frames,
             "required_csv_fields": list(REQUIRED_CSV_FIELDS),
         }

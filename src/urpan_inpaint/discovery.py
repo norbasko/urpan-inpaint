@@ -41,6 +41,7 @@ def sequence_output_dirs(output_root: Path, sequence_id: str) -> dict[str, Path]
         "masks_inpaint": base / "masks" / "inpaint",
         "masks_union_debug": base / "masks" / "union_debug",
         "cubemap": base / "cubemap",
+        "qa_metrics": base / "qa" / "metrics",
         "qa_overlays": base / "qa" / "overlays",
         "qa_contact_sheets": base / "qa" / "contact_sheets",
         "manifests": base / "manifests",
@@ -311,6 +312,19 @@ def write_sequence_manifest(manifest: SequenceManifest) -> None:
             "sam2_temporal_prior_count",
             "sam2_refine_status",
             "sam2_refine_error",
+            "qa_sky_ratio",
+            "qa_dynamic_ratio",
+            "qa_roof_ratio",
+            "qa_inpaint_ratio",
+            "qa_mask_components_dynamic",
+            "qa_mask_components_roof",
+            "qa_seam_delta_rgb",
+            "qa_seam_delta_alpha",
+            "qa_used_propainter",
+            "qa_used_lama_fallback",
+            "qa_processing_time_sec",
+            "qa_status",
+            "qa_error",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

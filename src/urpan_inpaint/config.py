@@ -99,6 +99,8 @@ class IndexConfig:
     lama_model_id: str = "LaMa"
     lama_command: str = ""
     lama_device: str = "auto"
+    qa_sample_count: int = 8
+    qa_diagnostic_panel_width_px: int = 320
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

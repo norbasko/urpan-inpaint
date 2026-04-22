@@ -12,6 +12,7 @@ from urpan_inpaint.fusion import run_mask_fusion
 from urpan_inpaint.inpainting import run_propainter_inpainting
 from urpan_inpaint.normalization import run_erp_normalization
 from urpan_inpaint.projection import run_cubemap_projection
+from urpan_inpaint.qa import run_qa
 from urpan_inpaint.refinement import run_sam2_refinement
 from urpan_inpaint.semantic import run_semantic_parsing
 
@@ -744,6 +745,52 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Device token passed into the LaMa command template.",
     )
+
+    qa_parser = subparsers.add_parser(
+        "qa",
+        help="Compute per-frame and per-sequence QA metrics and sampled diagnostic panels.",
+    )
+    qa_parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust"),
+        help="Dataset root containing GS* sequence directories.",
+    )
+    qa_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust/inpaint"),
+        help="Output root containing final inpaint outputs and masks.",
+    )
+    qa_parser.add_argument(
+        "--sequence",
+        action="append",
+        default=[],
+        help="Sequence ID to process. May be passed multiple times.",
+    )
+    qa_parser.add_argument(
+        "--min-valid-frames",
+        type=int,
+        default=3,
+        help="Minimum valid frames required for a sequence to remain eligible.",
+    )
+    qa_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Measure QA without writing metrics, manifests, or diagnostic panels.",
+    )
+    qa_parser.add_argument(
+        "--qa-sample-count",
+        type=int,
+        default=8,
+        help="Number of valid frames per sequence to render as diagnostic overlay panels.",
+    )
+    qa_parser.add_argument(
+        "--qa-diagnostic-panel-width-px",
+        type=int,
+        default=320,
+        help="Width of each panel in sampled diagnostic contact sheets.",
+    )
     return parser
 
 
@@ -1239,6 +1286,47 @@ def handle_inpaint_sequence(args: argparse.Namespace) -> int:
     return 0 if summary["failed_sequences"] == 0 else 1
 
 
+def handle_qa(args: argparse.Namespace) -> int:
+    config = IndexConfig(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        min_valid_frames=args.min_valid_frames,
+        dry_run=args.dry_run,
+        qa_sample_count=args.qa_sample_count,
+        qa_diagnostic_panel_width_px=args.qa_diagnostic_panel_width_px,
+    )
+    manifests = run_qa(config, sequence_ids=args.sequence or None)
+    summary = {
+        "dataset_root": str(config.dataset_root),
+        "output_root": str(config.output_root),
+        "dry_run": config.dry_run,
+        "qa_sample_count": config.qa_sample_count,
+        "qa_diagnostic_panel_width_px": config.qa_diagnostic_panel_width_px,
+        "sequence_count": len(manifests),
+        "qa_sequences": sum(1 for item in manifests if item.status == "ready"),
+        "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
+        "frames_processed": sum(
+            sum(1 for row in item.rows if row.qa_status == "measured")
+            for item in manifests
+        ),
+        "frames_skipped": sum(
+            sum(1 for row in item.rows if row.qa_status == "skipped")
+            for item in manifests
+        ),
+        "frames_with_fallback": sum(
+            sum(1 for row in item.rows if row.qa_used_lama_fallback)
+            for item in manifests
+        ),
+        "failed_frames": sum(
+            sum(1 for row in item.rows if row.qa_status == "failed")
+            for item in manifests
+        ),
+        "sequences": [item.to_summary_dict() for item in manifests],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["failed_sequences"] == 0 else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -1258,6 +1346,8 @@ def main() -> int:
         return handle_fuse_masks(args)
     if args.command == "inpaint-sequence":
         return handle_inpaint_sequence(args)
+    if args.command == "qa":
+        return handle_qa(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
