@@ -88,6 +88,11 @@ class IndexConfig:
     roof_erode_after_dilate_px: int = 0
     inpaint_window_size: int = 24
     inpaint_window_stride: int = 12
+    propainter_model_id: str = "ProPainter"
+    propainter_command: str = ""
+    propainter_chunk_size: int = 8
+    propainter_device: str = "auto"
+    propainter_face_feather_px: int = 64
     sam2_temporal_propagation: bool = True
     sam2_temporal_iou_threshold: float = 0.45
     sam2_temporal_area_ratio_min: float = 0.5

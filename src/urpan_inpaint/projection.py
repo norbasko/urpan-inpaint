@@ -5,11 +5,11 @@ from typing import Iterable, Optional
 
 from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.cubemap import (
+    CubemapProjection,
     cubemap_cache_exists,
     cubemap_metadata_path,
     erp_to_cubemap,
-    load_cubemap_face_rgbs,
-    load_cubemap_metadata,
+    load_cubemap_projection,
     save_cubemap_projection,
 )
 from urpan_inpaint.discovery import run_indexing, write_sequence_manifest
@@ -20,7 +20,7 @@ from urpan_inpaint.models import FrameRecord, SequenceManifest
 def _project_frame(
     frame: FrameRecord,
     config: IndexConfig,
-) -> tuple[FrameRecord, object]:
+) -> tuple[FrameRecord, CubemapProjection]:
     if not frame.file_exists:
         raise RuntimeError("Referenced fixed frame is missing")
 
@@ -101,25 +101,43 @@ def project_frame_record(
     )
 
 
-def load_or_create_cubemap_face_rgbs(
+def _projection_metadata(projection: CubemapProjection, face_cache_format: str = "npz") -> dict[str, object]:
+    return {
+        "erp_width": projection.erp_width,
+        "erp_height": projection.erp_height,
+        "face_size": projection.face_size,
+        "overlap_px": projection.overlap_px,
+        "total_face_size": projection.total_face_size,
+        "face_order": list(projection.faces.keys()),
+        "face_cache_format": face_cache_format,
+    }
+
+
+def load_or_create_cubemap_projection(
     frame: FrameRecord,
     config: IndexConfig,
-) -> tuple[FrameRecord, dict[str, object], dict[str, object]]:
+) -> tuple[FrameRecord, CubemapProjection]:
     if cubemap_cache_exists(frame.cubemap_cache_dir):
-        metadata = load_cubemap_metadata(frame.cubemap_cache_dir)
-        face_rgbs = load_cubemap_face_rgbs(frame.cubemap_cache_dir)
+        projection = load_cubemap_projection(frame.cubemap_cache_dir)
         updated_frame = replace(
             frame,
-            cubemap_face_size=int(metadata["face_size"]),
-            cubemap_overlap_px=int(metadata["overlap_px"]),
-            cubemap_total_face_size=int(metadata["total_face_size"]),
-            cubemap_face_cache_format=str(metadata.get("face_cache_format", "npz")),
+            erp_width=projection.erp_width,
+            erp_height=projection.erp_height,
+            erp_channels=3,
+            erp_dtype="uint8",
+            erp_horizontal_wrap_mode="circular",
+            erp_normalization_status="normalized",
+            erp_normalization_error="",
+            cubemap_face_size=projection.face_size,
+            cubemap_overlap_px=projection.overlap_px,
+            cubemap_total_face_size=projection.total_face_size,
+            cubemap_face_cache_format="npz",
             cubemap_faces_cached=True,
             cubemap_metadata_path=cubemap_metadata_path(frame.cubemap_cache_dir),
             cubemap_projection_status="projected",
             cubemap_projection_error="",
         )
-        return updated_frame, metadata, face_rgbs
+        return updated_frame, projection
 
     normalized_frame, projection = _project_frame(frame, config)
     metadata_path = None
@@ -136,13 +154,15 @@ def load_or_create_cubemap_face_rgbs(
         cubemap_projection_status="projected",
         cubemap_projection_error="",
     )
-    metadata = {
-        "face_size": projection.face_size,
-        "overlap_px": projection.overlap_px,
-        "total_face_size": projection.total_face_size,
-        "face_order": list(projection.faces.keys()),
-        "face_cache_format": "npz",
-    }
+    return projected_frame, projection
+
+
+def load_or_create_cubemap_face_rgbs(
+    frame: FrameRecord,
+    config: IndexConfig,
+) -> tuple[FrameRecord, dict[str, object], dict[str, object]]:
+    projected_frame, projection = load_or_create_cubemap_projection(frame, config)
+    metadata = _projection_metadata(projection, projected_frame.cubemap_face_cache_format or "npz")
     face_rgbs = {face_name: face.rgb for face_name, face in projection.faces.items()}
     return projected_frame, metadata, face_rgbs
 

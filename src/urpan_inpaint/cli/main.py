@@ -9,6 +9,7 @@ from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.detection import run_grounding_detection
 from urpan_inpaint.discovery import run_indexing
 from urpan_inpaint.fusion import run_mask_fusion
+from urpan_inpaint.inpainting import run_propainter_inpainting
 from urpan_inpaint.normalization import run_erp_normalization
 from urpan_inpaint.projection import run_cubemap_projection
 from urpan_inpaint.refinement import run_sam2_refinement
@@ -610,6 +611,104 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Seam-aware smoothing iterations for the refined sky mask.",
     )
+
+    inpaint_parser = subparsers.add_parser(
+        "inpaint-sequence",
+        help="Run ProPainter on each cubemap face video stream using fused INPAINT masks.",
+    )
+    inpaint_parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust"),
+        help="Dataset root containing GS* sequence directories.",
+    )
+    inpaint_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/vision/data/kaust/inpaint"),
+        help="Output root for manifests and pipeline artifacts.",
+    )
+    inpaint_parser.add_argument(
+        "--sequence",
+        action="append",
+        default=[],
+        help="Sequence ID to process. May be passed multiple times.",
+    )
+    inpaint_parser.add_argument(
+        "--min-valid-frames",
+        type=int,
+        default=3,
+        help="Minimum valid frames required for a sequence to remain eligible.",
+    )
+    inpaint_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan ProPainter inpainting without writing output files.",
+    )
+    inpaint_parser.add_argument(
+        "--skip-checksum",
+        action="store_true",
+        help="Skip SHA-256 computation if cubemap projection cache is missing.",
+    )
+    inpaint_parser.add_argument(
+        "--cube-face-size",
+        type=int,
+        default=1536,
+        help="Inner cubemap face size in pixels when projection cache is missing.",
+    )
+    inpaint_parser.add_argument(
+        "--cube-overlap-px",
+        type=int,
+        default=64,
+        help="Guard-band overlap on all cubemap faces when projection cache is missing.",
+    )
+    inpaint_parser.add_argument(
+        "--skip-face-cache",
+        action="store_true",
+        help="Keep projected face tensors in memory only if cubemap cache is missing.",
+    )
+    inpaint_parser.add_argument(
+        "--inpaint-window-size",
+        type=int,
+        default=24,
+        help="Temporal ProPainter window size.",
+    )
+    inpaint_parser.add_argument(
+        "--inpaint-window-stride",
+        type=int,
+        default=12,
+        help="Temporal ProPainter window stride. Must be smaller than the window size.",
+    )
+    inpaint_parser.add_argument(
+        "--propainter-model-id",
+        default="ProPainter",
+        help="ProPainter implementation identifier recorded in manifests.",
+    )
+    inpaint_parser.add_argument(
+        "--propainter-command",
+        default="",
+        help=(
+            "External ProPainter command template. It may use {frames_dir}, {masks_dir}, "
+            "{output_dir}, {face_name}, and {device}; it must write 000000.png, 000001.png, ..."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--propainter-device",
+        default="auto",
+        help="Device token passed into the ProPainter command template.",
+    )
+    inpaint_parser.add_argument(
+        "--propainter-chunk-size",
+        type=int,
+        default=8,
+        help="Maximum frames sent to one ProPainter inference call.",
+    )
+    inpaint_parser.add_argument(
+        "--propainter-face-feather-px",
+        type=int,
+        default=64,
+        help="Feather width used when reprojecting independently inpainted faces back to ERP.",
+    )
     return parser
 
 
@@ -990,6 +1089,75 @@ def handle_fuse_masks(args: argparse.Namespace) -> int:
     return 0 if summary["failed_sequences"] == 0 else 1
 
 
+def handle_inpaint_sequence(args: argparse.Namespace) -> int:
+    config = IndexConfig(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        min_valid_frames=args.min_valid_frames,
+        dry_run=args.dry_run,
+        compute_checksums=not args.skip_checksum,
+        cube_face_size=args.cube_face_size,
+        cube_overlap_px=args.cube_overlap_px,
+        cache_cubemap_faces=not args.skip_face_cache,
+        inpaint_window_size=args.inpaint_window_size,
+        inpaint_window_stride=args.inpaint_window_stride,
+        propainter_model_id=args.propainter_model_id,
+        propainter_command=args.propainter_command,
+        propainter_device=args.propainter_device,
+        propainter_chunk_size=args.propainter_chunk_size,
+        propainter_face_feather_px=args.propainter_face_feather_px,
+    )
+    if not config.dry_run and not config.propainter_command:
+        print(
+            json.dumps(
+                {
+                    "error": "inpaint-sequence requires --propainter-command unless --dry-run is used",
+                    "propainter_command_placeholders": [
+                        "{frames_dir}",
+                        "{masks_dir}",
+                        "{output_dir}",
+                        "{face_name}",
+                        "{device}",
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    manifests = run_propainter_inpainting(config, sequence_ids=args.sequence or None)
+    summary = {
+        "dataset_root": str(config.dataset_root),
+        "output_root": str(config.output_root),
+        "dry_run": config.dry_run,
+        "compute_checksums": config.compute_checksums,
+        "cube_face_size": config.cube_face_size,
+        "cube_overlap_px": config.cube_overlap_px,
+        "cache_cubemap_faces": config.cache_cubemap_faces,
+        "inpaint_window_size": config.inpaint_window_size,
+        "inpaint_window_stride": config.inpaint_window_stride,
+        "propainter_model_id": config.propainter_model_id,
+        "propainter_device": config.propainter_device,
+        "propainter_chunk_size": config.propainter_chunk_size,
+        "propainter_face_feather_px": config.propainter_face_feather_px,
+        "sequence_count": len(manifests),
+        "inpainted_sequences": sum(1 for item in manifests if item.status == "ready"),
+        "failed_sequences": sum(1 for item in manifests if item.status != "ready"),
+        "inpainted_frames": sum(
+            sum(1 for row in item.rows if row.propainter_status == "inpainted")
+            for item in manifests
+        ),
+        "failed_frames": sum(
+            sum(1 for row in item.rows if row.propainter_status == "failed")
+            for item in manifests
+        ),
+        "sequences": [item.to_summary_dict() for item in manifests],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["failed_sequences"] == 0 else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -1007,6 +1175,8 @@ def main() -> int:
         return handle_refine_masks(args)
     if args.command == "fuse-masks":
         return handle_fuse_masks(args)
+    if args.command == "inpaint-sequence":
+        return handle_inpaint_sequence(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 

@@ -64,6 +64,12 @@ This implementation currently covers:
   - support short sequences with a single shorter window,
   - reconcile overlapping predictions by choosing the window where each frame is closest to the temporal center,
   - break reconciliation ties deterministically in favor of the earlier window.
+- Sequence-level inpainting:
+  - run ProPainter independently on `front`, `right`, `back`, `left`, `up`, and `down` face streams,
+  - use fused ERP `INPAINT` masks projected into each face as mask guidance,
+  - preserve unmasked face pixels after ProPainter returns predictions,
+  - support chunked inference inside temporal windows for memory safety,
+  - crop guard bands for per-face artifacts and feather face seams during ERP reprojection.
 
 ## Install
 
@@ -216,6 +222,18 @@ urpan-inpaint fuse-masks \
   --roof-dilate-px 5
 ```
 
+Run sequence-level ProPainter inpainting from the fused masks:
+
+```bash
+urpan-inpaint inpaint-sequence \
+  --sequence GS030002 \
+  --output-root /tmp/urpan-inpaint-output \
+  --propainter-command "python run_propainter.py --frames {frames_dir} --masks {masks_dir} --output {output_dir} --device {device}" \
+  --inpaint-window-size 24 \
+  --inpaint-window-stride 12 \
+  --propainter-chunk-size 8
+```
+
 ## Output layout
 
 For each sequence `GSxxxxxx`, the pipeline writes:
@@ -294,3 +312,5 @@ The finalized per-frame sky mask is written to `masks/sky/<frame>.png` in ERP co
 The fusion stage overwrites final ERP-space masks under `masks/dynamic`, `masks/roof`, `masks/sky`, and `masks/inpaint`, and writes RGB union debug masks under `masks/union_debug`. Fusion JSON sidecars record source terms, morphology settings, warnings for missing inputs, and final mask areas.
 
 Temporal inpainting windows are planned by `urpan_inpaint.windowing`. The helper keeps windows overlapping by requiring `inpaint_window_stride < inpaint_window_size`, covers all valid frames, and exposes a reconciliation plan that downstream inpainting runners can use to stitch overlapping window predictions deterministically.
+
+Sequence-level inpainting writes final ERP `rgb/<frame>.png` and `rgba/<frame>.png` outputs. ProPainter face artifacts are written under each frame's cubemap directory as `propainter/<face>/<frame>.with_overlap.png`, the cropped `propainter/<face>/<frame>.png`, and the projected face mask `propainter/<face>/<frame>.mask.png`. Sequence-level `propainter/metadata.json` records face order, windows, chunks, and seam-feather settings.

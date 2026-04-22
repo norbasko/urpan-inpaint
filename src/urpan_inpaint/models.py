@@ -83,6 +83,12 @@ class FrameRecord:
     inpaint_mask_error: str = ""
     mask_fusion_status: str = "pending"
     mask_fusion_error: str = ""
+    propainter_model_id: str = ""
+    propainter_output_dir: Optional[Path] = None
+    propainter_window_count: Optional[int] = None
+    propainter_chunk_count: Optional[int] = None
+    propainter_status: str = "pending"
+    propainter_error: str = ""
     semantic_model_id: str = ""
     semantic_output_dir: Optional[Path] = None
     semantic_has_panoptic: bool = False
@@ -168,6 +174,12 @@ class FrameRecord:
             "inpaint_mask_error": self.inpaint_mask_error,
             "mask_fusion_status": self.mask_fusion_status,
             "mask_fusion_error": self.mask_fusion_error,
+            "propainter_model_id": self.propainter_model_id,
+            "propainter_output_dir": "" if self.propainter_output_dir is None else str(self.propainter_output_dir),
+            "propainter_window_count": "" if self.propainter_window_count is None else str(self.propainter_window_count),
+            "propainter_chunk_count": "" if self.propainter_chunk_count is None else str(self.propainter_chunk_count),
+            "propainter_status": self.propainter_status,
+            "propainter_error": self.propainter_error,
             "semantic_model_id": self.semantic_model_id,
             "semantic_output_dir": "" if self.semantic_output_dir is None else str(self.semantic_output_dir),
             "semantic_has_panoptic": "1" if self.semantic_has_panoptic else "0",
@@ -232,6 +244,10 @@ class SequenceManifest:
         fusion_failed_frames = [
             row.frame_name for row in self.rows if row.mask_fusion_status == "failed"
         ]
+        propainter_frames = sum(1 for row in self.rows if row.propainter_status == "inpainted")
+        propainter_failed_frames = [
+            row.frame_name for row in self.rows if row.propainter_status == "failed"
+        ]
         parsed_frames = sum(1 for row in self.rows if row.semantic_parse_status == "parsed")
         semantic_failed_frames = [
             row.frame_name for row in self.rows if row.semantic_parse_status == "failed"
@@ -269,6 +285,8 @@ class SequenceManifest:
             "dynamic_mask_frames": dynamic_mask_frames,
             "inpaint_mask_frames": inpaint_mask_frames,
             "fusion_failed_frames": fusion_failed_frames,
+            "propainter_frames": propainter_frames,
+            "propainter_failed_frames": propainter_failed_frames,
             "parsed_frames": parsed_frames,
             "semantic_failed_frames": semantic_failed_frames,
             "detected_frames": detected_frames,
