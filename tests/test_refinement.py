@@ -11,7 +11,13 @@ from PIL import Image
 
 from urpan_inpaint.config import IndexConfig
 from urpan_inpaint.cubemap import FACE_ORDER
-from urpan_inpaint.refinement import RefinedMask, _regularize_sky_face_mask, run_sam2_refinement
+from urpan_inpaint.refinement import (
+    RefinedMask,
+    _normalize_sam2_post_process_inputs,
+    _post_process_sam2_masks,
+    _regularize_sky_face_mask,
+    run_sam2_refinement,
+)
 
 
 class FakeSam2Refiner:
@@ -284,6 +290,48 @@ class RefinementTests(unittest.TestCase):
         self.assertGreater(int((result[:4, :5] > 0).sum()), 0)
         self.assertEqual(int((result[8:10, :] > 0).sum()), 0)
         self.assertEqual(int((result[:4, 5] > 0).sum()), 0)
+
+    def test_normalize_sam2_post_process_inputs_splits_streaming_object_batch(self) -> None:
+        masks = np.zeros((4, 1, 256, 256), dtype=np.float32)
+
+        normalized = _normalize_sam2_post_process_inputs(masks)
+
+        self.assertEqual(len(normalized), 4)
+        self.assertTrue(all(item.shape == (1, 1, 256, 256) for item in normalized))
+
+    def test_post_process_sam2_masks_passes_list_of_4d_batches(self) -> None:
+        class FakeProcessor:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def post_process_masks(self, masks, original_sizes, mask_threshold=0.0, binarize=True):
+                self.calls.append(
+                    {
+                        "count": len(masks),
+                        "shapes": [tuple(mask.shape) for mask in masks],
+                        "original_sizes": original_sizes,
+                        "mask_threshold": mask_threshold,
+                        "binarize": binarize,
+                    }
+                )
+                return masks
+
+        processor = FakeProcessor()
+        masks = np.zeros((3, 1, 256, 256), dtype=np.float32)
+
+        processed = _post_process_sam2_masks(
+            processor,
+            masks,
+            [[576, 576], [576, 576], [576, 576]],
+            mask_threshold=0.25,
+        )
+
+        self.assertEqual(len(processed), 3)
+        self.assertEqual(processor.calls[0]["count"], 3)
+        self.assertEqual(processor.calls[0]["shapes"], [(1, 1, 256, 256)] * 3)
+        self.assertEqual(processor.calls[0]["original_sizes"], [[576, 576], [576, 576], [576, 576]])
+        self.assertEqual(processor.calls[0]["mask_threshold"], 0.25)
+        self.assertTrue(processor.calls[0]["binarize"])
 
     def test_temporal_propagation_uses_stable_roof_prior(self) -> None:
         sequence_id = "GS999502"

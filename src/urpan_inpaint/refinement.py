@@ -561,11 +561,11 @@ class Sam2FaceRefiner:
                 inputs["input_masks"] = self._prepare_prior_mask(prompt.prior_mask)
             with self.torch.no_grad():
                 outputs = self.model(**inputs, multimask_output=False)
-            masks = self.processor.post_process_masks(
-                outputs.pred_masks.cpu(),
+            masks = _post_process_sam2_masks(
+                self.processor,
+                outputs.pred_masks,
                 inputs["original_sizes"],
-                mask_threshold=self.mask_threshold,
-                binarize=True,
+                self.mask_threshold,
             )[0]
             mask_array = np.asarray(masks.detach().cpu().numpy()).reshape(-1, rgb.shape[0], rgb.shape[1])
             scores = np.asarray(outputs.iou_scores.detach().cpu().numpy()).reshape(-1)
@@ -599,7 +599,7 @@ class Sam2FaceRefiner:
             resample=Image.Resampling.NEAREST,
         )
         mask = np.asarray(resized) > 0
-        return self.torch.as_tensor(mask[None, :, :], dtype=self.torch.float32, device=self.device)
+        return self.torch.as_tensor(mask[None, None, :, :], dtype=self.torch.float32, device=self.device)
 
 
 class Sam2StreamingVideoRefiner:
@@ -808,13 +808,19 @@ class Sam2StreamingVideoRefiner:
         object_ids = [int(obj_id) for obj_id in output.object_ids]
         if not object_ids:
             return []
-        masks = self.processor.post_process_masks(
-            output.pred_masks.detach().cpu(),
+        masks = _post_process_sam2_masks(
+            self.processor,
+            output.pred_masks,
             [[height, width] for _ in object_ids],
-            mask_threshold=self.mask_threshold,
-            binarize=True,
+            self.mask_threshold,
         )
-        mask_array = np.asarray(masks.detach().cpu().numpy()).reshape(len(object_ids), -1, height, width)[:, 0]
+        mask_array = np.stack(
+            [
+                np.asarray(mask.detach().cpu().numpy()).reshape(-1, height, width)[0]
+                for mask in masks
+            ],
+            axis=0,
+        )
         logits = getattr(output, "object_score_logits", None)
         if logits is not None:
             scores = self.torch.sigmoid(logits.detach().cpu()).numpy().reshape(-1)
@@ -863,6 +869,46 @@ def _mask_centroid(mask: np.ndarray) -> Optional[np.ndarray]:
     if len(xs) == 0:
         return None
     return np.asarray([float(xs.mean()), float(ys.mean())], dtype=np.float32)
+
+
+def _normalize_sam2_post_process_inputs(masks: Any) -> list[Any]:
+    def _to_cpu(item: Any) -> Any:
+        return item.detach().cpu() if hasattr(item, "detach") else item
+
+    if isinstance(masks, (list, tuple)):
+        normalized: list[Any] = []
+        for item in masks:
+            item = _to_cpu(item)
+            ndim = getattr(item, "ndim", None)
+            if ndim == 4:
+                normalized.append(item)
+            elif ndim == 3:
+                normalized.append(item[None, ...])
+            else:
+                raise ValueError(f"Unsupported SAM 2 mask container shape: {getattr(item, 'shape', None)}")
+        return normalized
+
+    masks = _to_cpu(masks)
+    ndim = getattr(masks, "ndim", None)
+    if ndim == 5:
+        return [masks[index] for index in range(int(masks.shape[0]))]
+    if ndim == 4:
+        return [masks[index : index + 1] for index in range(int(masks.shape[0]))]
+    raise ValueError(f"Unsupported SAM 2 pred_masks shape: {getattr(masks, 'shape', None)}")
+
+
+def _post_process_sam2_masks(
+    processor: Any,
+    masks: Any,
+    original_sizes: Any,
+    mask_threshold: float,
+) -> list[Any]:
+    return processor.post_process_masks(
+        _normalize_sam2_post_process_inputs(masks),
+        original_sizes,
+        mask_threshold=mask_threshold,
+        binarize=True,
+    )
 
 
 def _empty_face_payload() -> dict[str, np.ndarray]:
